@@ -544,7 +544,8 @@ async def chat_completions(request: ChatCompletionRequest, authorization: str = 
 
     # 添加请求日志
     logger.info(f"Received chat request: model={request.model}, stream={request.stream}")
-    messages = [msg.model_dump() for msg in request.messages]
+    messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
+
     if not request.stream:
         # 非流式响应处理
         content = ""
