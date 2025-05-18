@@ -188,7 +188,7 @@ def get_auth_token(device_id: str) -> Tuple[str, str]:
             f"{Config.BASE_URL}/user/sessions",
             headers=headers,
             content=data,
-            timeout=30
+            timeout=300
         )
         response.raise_for_status()
         result = response.json()
@@ -215,7 +215,7 @@ def create_conversation(device_id: str, token: str, user_id: str) -> str:
             f"{Config.BASE_URL}/core/conversations/users/{user_id}/bots/{Config.BOT_ID}/conversation",
             headers=headers,
             content=data,
-            timeout=30
+            timeout=300
         )
         response.raise_for_status()
         return response.json()['data']
@@ -444,7 +444,7 @@ async def generate_response(messages: List[dict], model: str, temperature: float
 
     try:
         # 使用 stream=True 参数，实现真正的流式处理
-        async with httpx.AsyncClient(timeout=httpx.Timeout(10)) as client:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(150)) as client:
             async with client.stream('POST', f"{Config.BASE_URL}/core/conversation/chat/v1",
                                      headers=headers, content=data) as response:
                 response.raise_for_status()
@@ -543,11 +543,7 @@ async def chat_completions(request: ChatCompletionRequest, authorization: str = 
 
     # 添加请求日志
     logger.info(f"Received chat request: model={request.model}, stream={request.stream}")
-    system_prompt = "你是hefengfan的助手。我将提供符合OpenAI规范的信息。在回复中，请只用[url](url)的格式引用链接。请以简洁明了的方式，详略得当的回答用户的问题。"
-
-    # 从请求中提取消息，并将它们转换为字典
-    user_messages = [msg.model_dump() for msg in request.messages]
-    messages = [{"role": "system", "content": system_prompt}] + user_messages
+    messages = [msg.model_dump() for msg in request.messages]
 
     if not request.stream:
         # 非流式响应处理
