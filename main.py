@@ -88,7 +88,6 @@ class ChatCompletionRequest(BaseModel):
     frequency_penalty: Optional[float] = 0
     user: Optional[str] = None
 
-
 class ModelData(BaseModel):
     id: str
     object: str = "model"
@@ -544,7 +543,11 @@ async def chat_completions(request: ChatCompletionRequest, authorization: str = 
 
     # 添加请求日志
     logger.info(f"Received chat request: model={request.model}, stream={request.stream}")
-    messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
+    system_prompt = "你是hefengfan的助手。我将提供符合OpenAI规范的信息。在回复中，请只用[url](url)的格式引用链接。请以简洁明了的方式，详略得当的回答用户的问题。"
+
+    # 从请求中提取消息，并将它们转换为字典
+    user_messages = [msg.model_dump() for msg in request.messages]
+    all_messages = [{"role": "system", "content": system_prompt}] + user_messages
 
     if not request.stream:
         # 非流式响应处理
