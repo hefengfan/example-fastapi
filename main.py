@@ -547,7 +547,7 @@ async def chat_completions(request: ChatCompletionRequest, authorization: str = 
 
     # 从请求中提取消息，并将它们转换为字典
     user_messages = [msg.model_dump() for msg in request.messages]
-    all_messages = [{"role": "system", "content": system_prompt}] + user_messages
+    messages = [{"role": "system", "content": system_prompt}] + user_messages
 
     if not request.stream:
         # 非流式响应处理
