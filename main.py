@@ -5,152 +5,85 @@ import uuid
 import datetime
 import time
 import re
+import gc
+import os
+import psutil
 from fastapi import FastAPI, HTTPException, Header, Request, BackgroundTasks
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from typing import List, Optional, Dict, Any, AsyncGenerator, Tuple
 import httpx
 import logging
 import hashlib
 import base64
 import hmac
-from starlette.middleware.cors import CORSMiddleware
-from contextlib import asynccontextmanager
-import gc
 
-# Configure logging with minimal overhead
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Track last API call time for garbage collection
-last_api_call_time = time.time()
-gc_interval = 300  # 5 minutes
+from fastapi.middleware.cors import CORSMiddleware  # 添加到顶部导入部分
 
-# Use lifespan for more efficient resource management
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Initialize resources on startup
-    client = httpx.AsyncClient(timeout=httpx.Timeout(150), limits=httpx.Limits(max_keepalive_connections=5, max_connections=10))
-    app.state.http_client = client
-    
-    # Start background garbage collection task
-    app.state.gc_task = asyncio.create_task(periodic_garbage_collection(app))
-    
-    # Initialize session on startup
-    try:
-        await session_manager.refresh_if_needed(client)
-    except Exception as e:
-        logger.error(f"Startup initialization error: {e}")
-    
-    yield
-    
-    # Clean up resources on shutdown
-    app.state.gc_task.cancel()
-    try:
-        await app.state.gc_task
-    except asyncio.CancelledError:
-        pass
-    
-    await client.aclose()
-    gc.collect()  # Force garbage collection
+# 在创建FastAPI实例后添加
+app = FastAPI()
 
-# Periodic garbage collection function
-async def periodic_garbage_collection(app):
-    """Background task to periodically clean up memory when idle"""
-    while True:
-        try:
-            await asyncio.sleep(60)  # Check every minute
-            current_time = time.time()
-            global last_api_call_time
-            
-            # If no API calls for gc_interval seconds, run garbage collection
-            if current_time - last_api_call_time > gc_interval:
-                logger.info("Server idle, running garbage collection")
-                gc.collect()
-                
-                # Also close and recreate HTTP client if it's been idle too long
-                if hasattr(app.state, 'http_client'):
-                    old_client = app.state.http_client
-                    app.state.http_client = httpx.AsyncClient(
-                        timeout=httpx.Timeout(150), 
-                        limits=httpx.Limits(max_keepalive_connections=5, max_connections=10)
-                    )
-                    await old_client.aclose()
-        except Exception as e:
-            logger.error(f"Error in garbage collection task: {e}")
-            await asyncio.sleep(60)  # Wait before retrying
-
-# Create FastAPI app with lifespan
-app = FastAPI(lifespan=lifespan)
-
-# Add CORS middleware with minimal overhead
+# 添加CORS中间件
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # 允许所有来源，生产环境应更严格
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["*"],  # 允许所有方法
+    allow_headers=["*"],  # 允许所有头
 )
 
-# Configuration class with minimal memory footprint
+# 全局变量，用于跟踪最后一次API调用的时间
+last_api_call_time = time.time()
+# 内存使用阈值（百分比），超过此值将触发垃圾回收
+MEMORY_THRESHOLD = 70
+# 垃圾回收间隔（秒）
+GC_INTERVAL = 300  # 5分钟
+
+# 添加配置类来管理API配置
 class Config:
     API_KEY = "TkoWuEN8cpDJubb7Zfwxln16NQDZIc8z"
     BASE_URL = "https://api-bj.wenxiaobai.com/api/v1.0"
     BOT_ID = 200006
     DEFAULT_MODEL = "DeepSeek-R1"
 
-# Optimized session manager with minimal state
+
+# 添加会话管理类
 class SessionManager:
     def __init__(self):
         self.device_id = None
         self.token = None
         self.user_id = None
         self.conversation_id = None
-        self.last_refresh = 0
-        self.refresh_interval = 3600  # Refresh token every hour
+
+    def initialize(self):
+        """初始化会话"""
+        self.device_id = generate_device_id()
+        self.token, self.user_id = get_auth_token(self.device_id)
+        self.conversation_id = create_conversation(self.device_id, self.token, self.user_id)
+        logger.info(f"Session initialized: user_id={self.user_id}, conversation_id={self.conversation_id}")
 
     def is_initialized(self):
-        """Check if session is initialized"""
+        """检查会话是否已初始化"""
         return all([self.device_id, self.token, self.user_id, self.conversation_id])
 
-    async def refresh_if_needed(self, client=None):
-        """Refresh session if needed"""
-        current_time = time.time()
-        
-        # Check if refresh is needed
-        if (not self.is_initialized() or 
-            current_time - self.last_refresh > self.refresh_interval):
-            await self.initialize(client)
-            self.last_refresh = current_time
+    async def refresh_if_needed(self):
+        """如果需要，刷新会话"""
+        if not self.is_initialized():
+            self.initialize()
 
-    async def initialize(self, client=None):
-        """Initialize session with minimal overhead"""
-        close_client = False
-        if client is None:
-            client = httpx.AsyncClient(timeout=httpx.Timeout(30))
-            close_client = True
-            
-        try:
-            self.device_id = generate_device_id()
-            self.token, self.user_id = await get_auth_token(self.device_id, client)
-            self.conversation_id = await create_conversation(self.device_id, self.token, self.user_id, client)
-            logger.info(f"Session initialized: user_id={self.user_id}, conversation_id={self.conversation_id}")
-        finally:
-            if close_client:
-                await client.aclose()
 
-# Create session manager instance
+# 创建会话管理器实例
 session_manager = SessionManager()
 
-# Optimized Pydantic models with minimal validation overhead
+
 class Message(BaseModel):
     role: str
     content: str
     name: Optional[str] = None
+
 
 class ChatCompletionRequest(BaseModel):
     model: str
@@ -173,24 +106,27 @@ class ModelData(BaseModel):
     root: str
     parent: Optional[str] = None
 
-# Utility functions optimized for memory efficiency
+
 def generate_device_id() -> str:
-    """Generate device ID with minimal overhead"""
+    """生成设备ID"""
     return f"{uuid.uuid4().hex}_{int(time.time() * 1000)}_{random.randint(100000, 999999)}"
 
+
 def generate_timestamp() -> str:
-    """Generate UTC timestamp string with minimal overhead"""
+    """生成符合要求的UTC时间字符串"""
     timestamp_ms = int(time.time() * 1000) + 559
     utc_time = datetime.datetime.utcfromtimestamp(timestamp_ms / 1000.0)
     return utc_time.strftime('%a, %d %b %Y %H:%M:%S GMT')
 
+
 def calculate_sha256(data: str) -> str:
-    """Calculate SHA-256 digest with minimal overhead"""
+    """计算SHA-256摘要"""
     sha256 = hashlib.sha256(data.encode()).digest()
     return base64.b64encode(sha256).decode()
 
+
 def generate_signature(timestamp: str, digest: str) -> str:
-    """Generate request signature with minimal overhead"""
+    """生成请求签名"""
     message = f"x-date: {timestamp}\ndigest: SHA-256={digest}"
     signature = hmac.new(
         Config.API_KEY.encode(),
@@ -199,9 +135,10 @@ def generate_signature(timestamp: str, digest: str) -> str:
     ).digest()
     return base64.b64encode(signature).decode()
 
+
 def create_common_headers(timestamp: str, digest: str, token: Optional[str] = None,
                           device_id: Optional[str] = None) -> dict:
-    """Create common request headers with minimal overhead"""
+    """创建通用请求头"""
     headers = {
         'accept': 'application/json, text/plain, */*',
         'accept-language': 'zh-CN,zh;q=0.9',
@@ -209,10 +146,14 @@ def create_common_headers(timestamp: str, digest: str, token: Optional[str] = No
         'content-type': 'application/json',
         'digest': f'SHA-256={digest}',
         'origin': 'https://www.wenxiaobai.com',
+        'priority': 'u=1, i',
         'referer': 'https://www.wenxiaobai.com/',
         'sec-ch-ua': '"Chromium";v="134", "Not:A-Brand";v="24", "Microsoft Edge";v="134"',
         'sec-ch-ua-mobile': '?0',
         'sec-ch-ua-platform': '"Windows"',
+        'sec-fetch-dest': 'empty',
+        'sec-fetch-mode': 'cors',
+        'sec-fetch-site': 'same-site',
         'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36 Edg/134.0.0.0',
         'x-date': timestamp,
         'x-yuanshi-appname': 'wenxiaobai',
@@ -234,8 +175,9 @@ def create_common_headers(timestamp: str, digest: str, token: Optional[str] = No
 
     return headers
 
-async def get_auth_token(device_id: str, client) -> Tuple[str, str]:
-    """Get authentication token with minimal overhead"""
+
+def get_auth_token(device_id: str) -> Tuple[str, str]:
+    """获取认证令牌"""
     timestamp = generate_timestamp()
     payload = {
         'deviceId': device_id,
@@ -251,23 +193,25 @@ async def get_auth_token(device_id: str, client) -> Tuple[str, str]:
     headers = create_common_headers(timestamp, digest)
 
     try:
-        response = await client.post(
+        response = httpx.post(
             f"{Config.BASE_URL}/user/sessions",
             headers=headers,
-            content=data
+            content=data,
+            timeout=300
         )
         response.raise_for_status()
         result = response.json()
         return result['data']['token'], result['data']['user']['id']
     except httpx.RequestError as e:
-        logger.error(f"Failed to get auth token: {e}")
-        raise HTTPException(status_code=500, detail=f"Authentication failed: {str(e)}")
+        logger.error(f"获取认证令牌失败: {e}")
+        raise HTTPException(status_code=500, detail=f"认证失败: {str(e)}")
     except (KeyError, json.JSONDecodeError) as e:
-        logger.error(f"Failed to parse auth response: {e}")
-        raise HTTPException(status_code=500, detail="Server returned invalid authentication data")
+        logger.error(f"解析认证响应失败: {e}")
+        raise HTTPException(status_code=500, detail="服务器返回了无效的认证数据")
 
-async def create_conversation(device_id: str, token: str, user_id: str, client) -> str:
-    """Create new conversation with minimal overhead"""
+
+def create_conversation(device_id: str, token: str, user_id: str) -> str:
+    """创建新的会话"""
     timestamp = generate_timestamp()
     payload = {'visitorId': device_id}
     data = json.dumps(payload, separators=(',', ':'))
@@ -276,55 +220,58 @@ async def create_conversation(device_id: str, token: str, user_id: str, client) 
     headers = create_common_headers(timestamp, digest, token, device_id)
 
     try:
-        response = await client.post(
+        response = httpx.post(
             f"{Config.BASE_URL}/core/conversations/users/{user_id}/bots/{Config.BOT_ID}/conversation",
             headers=headers,
-            content=data
+            content=data,
+            timeout=300
         )
         response.raise_for_status()
         return response.json()['data']
     except httpx.RequestError as e:
-        logger.error(f"Failed to create conversation: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to create conversation: {str(e)}")
+        logger.error(f"创建会话失败: {e}")
+        raise HTTPException(status_code=500, detail=f"创建会话失败: {str(e)}")
     except (KeyError, json.JSONDecodeError) as e:
-        logger.error(f"Failed to parse conversation response: {e}")
-        raise HTTPException(status_code=500, detail="Server returned invalid conversation data")
+        logger.error(f"解析会话响应失败: {e}")
+        raise HTTPException(status_code=500, detail="服务器返回了无效的会话数据")
 
-# Optimized content processing functions
+
 def is_thinking_content(content: str) -> bool:
-    """Check if content is thinking process"""
-    return "\`\`\`ys_think" in content
+    """判断内容是否为思考过程"""
+    return "```ys_think" in content
+
 
 def clean_thinking_content(content: str) -> str:
-    """Clean thinking process content, remove special markers"""
-    # Remove entire thinking block
-    if "\`\`\`ys_think" in content:
-        # Use regex to remove entire thinking block
-        cleaned = re.sub(r'\`\`\`ys_think.*?\`\`\`', '', content, flags=re.DOTALL)
-        # If only whitespace remains after cleaning, return empty string
+    """清理思考过程内容，移除特殊标记"""
+    # 移除整个思考块
+    if "```ys_think" in content:
+        # 使用正则表达式移除整个思考块
+        cleaned = re.sub(r'```ys_think.*?```', '', content, flags=re.DOTALL)
+        # 如果清理后只剩下空白字符，返回空字符串
         if cleaned and cleaned.strip():
             return cleaned.strip()
         return ""
     return content
 
-def clean_reference_tags(content: str) -> str:
-    """Remove reference tags like [这是一个数字](@ref) from content"""
-    # Remove patterns like [text](@ref)
-    cleaned = re.sub(r'\[[^\]]*\]$$@ref$$', '', content)
-    return cleaned
 
-# Optimized response chunk creation
+# 辅助函数：验证 API 密钥
+async def verify_api_key(authorization: str = Header(None)):
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Missing API key")
+
+    api_key = authorization.replace("Bearer ", "").strip()
+    if api_key != Config.API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    return api_key
+
+
 def create_chunk(sse_id: str, created: int, content: Optional[str] = None,
                  is_first: bool = False, meta: Optional[dict] = None,
                  finish_reason: Optional[str] = None) -> dict:
-    """Create response chunk with minimal overhead"""
+    """创建响应块"""
     delta = {}
 
     if content is not None:
-        # Clean reference tags from content
-        if content:
-            content = clean_reference_tags(content)
-            
         if is_first:
             delta = {"role": "assistant", "content": content}
         else:
@@ -345,36 +292,34 @@ def create_chunk(sse_id: str, created: int, content: Optional[str] = None,
         }]
     }
 
+
 async def process_message_event(data: dict, is_first_chunk: bool, in_thinking_block: bool,
                                 thinking_started: bool, thinking_content: list) -> Tuple[str, bool, bool, bool, list]:
-    """Process message event with minimal overhead"""
+    """处理消息事件"""
     content = data.get("content", "")
     timestamp = data.get("timestamp", "")
     created = int(timestamp) // 1000 if timestamp else int(time.time())
     sse_id = data.get('sseId', str(uuid.uuid4()))
     result = ""
 
-    # Clean reference tags from content
-    content = clean_reference_tags(content)
-
-    # Check if it's the start of a thinking block
-    if "\`\`\`ys_think" in content and not thinking_started:
+    # 检查是否是思考块的开始
+    if "```ys_think" in content and not thinking_started:
         thinking_started = True
         in_thinking_block = True
-        # Send thinking block start marker
+        # 发送思考块开始标记
         chunk = create_chunk(
             sse_id=sse_id,
             created=created,
             content="<Thinking>\n\n",
             is_first=is_first_chunk
         )
-        result = f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+        result = f"data: \{json.dumps(chunk, ensure_ascii=False)\}\n\n"
         return result, in_thinking_block, thinking_started, is_first_chunk, thinking_content
 
-    # Check if it's the end of a thinking block
-    if "\`\`\`" in content and in_thinking_block:
+    # 检查是否是思考块的结束
+    if "```" in content and in_thinking_block:
         in_thinking_block = False
-        # Send thinking block end marker
+        # 发送思考块结束标记
         chunk = create_chunk(
             sse_id=sse_id,
             created=created,
@@ -383,10 +328,10 @@ async def process_message_event(data: dict, is_first_chunk: bool, in_thinking_bl
         result = f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
         return result, in_thinking_block, thinking_started, is_first_chunk, thinking_content
 
-    # If in thinking block, collect thinking content
+    # 如果在思考块内，收集思考内容
     if in_thinking_block:
         thinking_content.append(content)
-        # Also send content in thinking block, but mark as thinking content
+        # 在思考块内也发送内容，但标记为思考内容
         chunk = create_chunk(
             sse_id=sse_id,
             created=created,
@@ -395,12 +340,15 @@ async def process_message_event(data: dict, is_first_chunk: bool, in_thinking_bl
         result = f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
         return result, in_thinking_block, thinking_started, is_first_chunk, thinking_content
 
-    # Clean content, remove thinking blocks
+    # 清理内容，移除思考块
     content = clean_thinking_content(content)
-    if not content:  # Skip if content is empty after cleaning
+    if not content:  # 如果清理后内容为空，跳过
         return result, in_thinking_block, thinking_started, is_first_chunk, thinking_content
 
-    # Send normal content
+    # 清理引用标记 [数字](@ref) 格式
+    content = clean_reference_annotations(content)
+
+    # 正常发送内容
     chunk = create_chunk(
         sse_id=sse_id,
         created=created,
@@ -410,23 +358,25 @@ async def process_message_event(data: dict, is_first_chunk: bool, in_thinking_bl
     result = f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
     return result, in_thinking_block, thinking_started, False, thinking_content
 
+
 def process_generate_end_event(data: dict, in_thinking_block: bool, thinking_content: list) -> List[str]:
-    """Process generation end event with minimal overhead"""
+    """处理生成结束事件"""
     result = []
     timestamp = data.get("timestamp", "")
     created = int(timestamp) // 1000 if timestamp else int(time.time())
     sse_id = data.get('sseId', str(uuid.uuid4()))
 
-    # If thinking block hasn't ended yet, send end marker
+    # 如果思考块还没有结束，发送结束标记
     if in_thinking_block:
         end_thinking_chunk = create_chunk(
             sse_id=sse_id,
             created=created,
-            content="\n<Thinking>\n</Thinking>\n\n"
+            content="\n<Thinking>
+</Thinking>\n\n"
         )
         result.append(f"data: {json.dumps(end_thinking_chunk, ensure_ascii=False)}\n\n")
 
-    # Add metadata
+    # 添加元数据
     meta_chunk = create_chunk(
         sse_id=sse_id,
         created=created,
@@ -434,7 +384,7 @@ def process_generate_end_event(data: dict, in_thinking_block: bool, thinking_con
     )
     result.append(f"data: {json.dumps(meta_chunk, ensure_ascii=False)}\n\n")
 
-    # Send end marker
+    # 发送结束标记
     end_chunk = create_chunk(
         sse_id=sse_id,
         created=created,
@@ -444,156 +394,99 @@ def process_generate_end_event(data: dict, in_thinking_block: bool, thinking_con
     result.append("data: [DONE]\n\n")
     return result
 
-# Optimized API key verification
-async def verify_api_key(authorization: str = Header(None)):
-    """Verify API key with minimal overhead"""
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Missing API key")
 
-    api_key = authorization.replace("Bearer ", "").strip()
-    if api_key != Config.API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API key")
-    return api_key
-
-# Format conversation history for better context understanding
-def format_conversation_history(messages: List[dict]) -> str:
-    """Format the conversation history to improve context understanding"""
-    formatted_history = []
-    
-    for msg in messages:
-        role = msg.get('role', '')
-        content = msg.get('content', '')
-        
-        if role == 'system':
-            formatted_history.append(f"System: {content}")
-        elif role == 'user':
-            formatted_history.append(f"User: {content}")
-        elif role == 'assistant':
-            formatted_history.append(f"Assistant: {content}")
-    
-    # Get the last user message separately (will be used as the main query)
-    last_user_message = ""
-    for msg in reversed(messages):
-        if msg.get('role') == 'user':
-            last_user_message = msg.get('content', '')
-            break
-    
-    # Return both the formatted history and the last user message
-    return "\n\n".join(formatted_history), last_user_message
-
-# Optimized response generation
 async def generate_response(messages: List[dict], model: str, temperature: float, stream: bool,
                             max_tokens: Optional[int] = None, presence_penalty: float = 0,
-                            frequency_penalty: float = 0, top_p: float = 1.0, 
-                            client=None) -> AsyncGenerator[str, None]:
-    """Generate response with true streaming and minimal memory usage"""
-    # Update last API call time for garbage collection
-    global last_api_call_time
-    last_api_call_time = time.time()
-    
-    # Ensure session is initialized
-    close_client = False
-    if client is None:
-        client = httpx.AsyncClient(timeout=httpx.Timeout(150))
-        close_client = True
-    
-    try:
-        await session_manager.refresh_if_needed(client)
+                            frequency_penalty: float = 0, top_p: float = 1.0) -> AsyncGenerator[str, None]:
+    """生成响应 - 使用真正的流式处理"""
+    # 确保会话已初始化
+    await session_manager.refresh_if_needed()
 
-        # Format conversation history for better context understanding
-        conversation_history, last_query = format_conversation_history(messages)
-        
-        timestamp = generate_timestamp()
-        payload = {
-            'userId': session_manager.user_id,
-            'botId': Config.BOT_ID,
-            'botAlias': 'custom',
-            'query': last_query,  # Use the last user message as the main query
-            'isRetry': False,
-            'breakingStrategy': 0,
-            'isNewConversation': True,
-            'mediaInfos': [],
-            'turnIndex': 0,
-            'rewriteQuery': '',
-            'conversationId': session_manager.conversation_id,
-            'capabilities': [
-                {
-                    'capability': 'otherBot',
-                    'capabilityRang': 0,
-                    'defaultQuery': '',
-                    'icon': 'https://wy-static.wenxiaobai.com/bot-capability/prod/%E6%B7%B1%E5%BA%A6%E6%80%9D%E8%80%83.png',
-                    'minAppVersion': '',
-                    'title': '深度思考(R1)',
-                    'BotId': 210029,
-                    'botDesc': '深度回答这个问题（DeepSeek R1）',
-                    'selectedIcon': 'https://wy-static.wenxiaobai.com/bot-capability/prod/%E6%B7%B1%E5%BA%A6%E6%80%9D%E8%80%83%E9%80%89%E4%B8%AD.png',
-                    'botIcon': 'https://platform-dev-1319140468.cos.ap-nanjing.myqcloud.com/bot/avatar/2025/02/06/612cbff8-51e6-4c6a-8530-cb551bcfda56.webp',
-                    'defaultHidden': False,
-                    'defaultSelected': False,
-                    'key': 'deep_think',
-                    'promptMenu': False,
-                    'isPromptMenu': False,
-                    'defaultPlaceholder': '',
-                    '_id': 'deep_think',
-                },
-            ],
-            'attachmentInfo': {
-                'url': {
-                    'infoList': [],
-                },
+    timestamp = generate_timestamp()
+    payload = {
+        'userId': session_manager.user_id,
+        'botId': Config.BOT_ID,
+        'botAlias': 'custom',
+        'query': messages[-1]['content'],
+        'isRetry': False,
+        'breakingStrategy': 0,
+        'isNewConversation': True,
+        'mediaInfos': [],
+        'turnIndex': 0,
+        'rewriteQuery': '',
+        'conversationId': session_manager.conversation_id,
+        'capabilities': [
+            {
+                'capability': 'otherBot',
+                'capabilityRang': 0,
+                'defaultQuery': '',
+                'icon': 'https://wy-static.wenxiaobai.com/bot-capability/prod/%E6%B7%B1%E5%BA%A6%E6%80%9D%E8%80%83.png',
+                'minAppVersion': '',
+                'title': '深度思考(R1)',
+                'botId': 210029,
+                'botDesc': '深度回答这个问题（DeepSeek R1）',
+                'selectedIcon': 'https://wy-static.wenxiaobai.com/bot-capability/prod/%E6%B7%B1%E5%BA%A6%E6%80%9D%E8%80%83%E9%80%89%E4%B8%AD.png',
+                'botIcon': 'https://platform-dev-1319140468.cos.ap-nanjing.myqcloud.com/bot/avatar/2025/02/06/612cbff8-51e6-4c6a-8530-cb551bcfda56.webp',
+                'defaultHidden': False,
+                'defaultSelected': False,
+                'key': 'deep_think',
+                'promptMenu': False,
+                'isPromptMenu': False,
+                'defaultPlaceholder': '',
+                '_id': 'deep_think',
             },
-            'inputWay': 'proactive',
-            'pureQuery': '',
-            # Add conversation history to help with context
-            'conversationHistory': conversation_history
-        }
-        data = json.dumps(payload, separators=(',', ':'))
-        digest = calculate_sha256(data)
+        ],
+        'attachmentInfo': {
+            'url': {
+                'infoList': [],
+            },
+        },
+        'inputWay': 'proactive',
+        'pureQuery': '',
+    }
+    data = json.dumps(payload, separators=(',', ':'))
+    digest = calculate_sha256(data)
 
-        # Create special headers for streaming request
-        headers = create_common_headers(timestamp, digest, session_manager.token, session_manager.device_id)
-        headers.update({
-            'accept': 'text/event-stream, text/event-stream',
-            'x-yuanshi-appversioncode': '',
-            'x-yuanshi-appversionname': '3.1.0',
-        })
+    # 创建流式请求的特殊头部
+    headers = create_common_headers(timestamp, digest, session_manager.token, session_manager.device_id)
+    headers.update({
+        'accept': 'text/event-stream, text/event-stream',
+        'x-yuanshi-appversioncode': '',
+        'x-yuanshi-appversionname': '3.1.0',
+    })
 
-        # Use stream=True parameter for true streaming
-        async with client.stream('POST', f"{Config.BASE_URL}/core/conversation/chat/v1",
-                                headers=headers, content=data) as response:
-            response.raise_for_status()
+    try:
+        # 使用 stream=True 参数，实现真正的流式处理
+        async with httpx.AsyncClient(timeout=httpx.Timeout(900)) as client:
+            async with client.stream('POST', f"{Config.BASE_URL}/core/conversation/chat/v1",
+                                     headers=headers, content=data) as response:
+                response.raise_for_status()
 
-            # Process streaming response
-            is_first_chunk = True
-            current_event = None
-            in_thinking_block = False
-            thinking_content = []
-            thinking_started = False
-            buffer = ""
+                # 处理流式响应
+                is_first_chunk = True
+                current_event = None
+                in_thinking_block = False
+                thinking_content = []
+                thinking_started = False
 
-            async for raw_line in response.aiter_bytes(1024):
-                buffer += raw_line.decode('utf-8', errors='replace')
-                lines = buffer.split('\n')
-                buffer = lines.pop()  # Keep the last incomplete line in the buffer
-                
-                for line in lines:
+                async for line in response.aiter_lines():
                     line = line.strip()
                     if not line:
                         current_event = None
                         continue
 
-                    # Parse event type
+                    # 解析事件类型
                     if line.startswith("event:"):
                         current_event = line[len("event:"):].strip()
                         continue
 
-                    # Process data line
+                    # 处理数据行
                     elif line.startswith("data:"):
                         json_str = line[len("data:"):].strip()
                         try:
                             data = json.loads(json_str)
 
-                            # Process message event
+                            # 处理消息事件
                             if current_event == "message":
                                 result, in_thinking_block, thinking_started, is_first_chunk, thinking_content = await process_message_event(
                                     data, is_first_chunk, in_thinking_block, thinking_started, thinking_content
@@ -601,40 +494,104 @@ async def generate_response(messages: List[dict], model: str, temperature: float
                                 if result:
                                     yield result
 
-                            # Process generation end event
+                            # 处理生成结束事件
                             elif current_event == "generateEnd":
                                 for chunk in process_generate_end_event(data, in_thinking_block, thinking_content):
                                     yield chunk
 
                         except json.JSONDecodeError as e:
-                            logger.error(f"JSON parsing error: {e}")
+                            logger.error(f"JSON解析错误: {e}")
                             continue
+
     except httpx.RequestError as e:
-        logger.error(f"Generate response error: {e}")
-        # Try to reinitialize session
+        logger.error(f"生成响应错误: {e}")
+        # 尝试重新初始化会话
         try:
-            await session_manager.initialize(client)
-            logger.info("Session reinitialized")
+            session_manager.initialize()
+            logger.info("会话已重新初始化")
         except Exception as re_init_error:
-            logger.error(f"Failed to reinitialize session: {re_init_error}")
-        raise HTTPException(status_code=500, detail=f"Request error: {str(e)}")
-    finally:
-        if close_client:
-            await client.aclose()
+            logger.error(f"重新初始化会话失败: {re_init_error}")
+        raise HTTPException(status_code=500, detail=f"请求错误: {str(e)}")
 
-# API endpoints
-@app.get("/")
-async def health(background_tasks: BackgroundTasks):
-    # Run garbage collection in the background
-    background_tasks.add_task(gc.collect)
-    return {"status": "ok", "message": "hefengfan API successfully deployed!"}
 
-@app.get("/v1/models")
-async def list_models():
-    """List available models"""
-    # Update last API call time
+# 新增函数：清理引用标记 [数字](@ref) 格式
+def clean_reference_annotations(content: str) -> str:
+    """清理引用标记，如 [这是一个数字](@ref)"""
+    # 使用正则表达式移除 [任何内容](@ref) 格式的文本
+    cleaned = re.sub(r'\[[^\]]*\]$$@ref$$', '', content)
+    return cleaned
+
+
+# 新增函数：获取当前内存使用情况
+def get_memory_usage() -> float:
+    """获取当前内存使用百分比"""
+    process = psutil.Process(os.getpid())
+    memory_info = process.memory_info()
+    memory_percent = process.memory_percent()
+    logger.info(f"内存使用: {memory_info.rss / 1024 / 1024:.2f} MB ({memory_percent:.2f}%)")
+    return memory_percent
+
+
+# 新增函数：执行垃圾回收
+def perform_garbage_collection():
+    """执行垃圾回收并记录结果"""
+    before_memory = get_memory_usage()
+    
+    # 执行完整的垃圾回收
+    collected = gc.collect(2)  # 强制收集所有代
+    
+    after_memory = get_memory_usage()
+    memory_freed = before_memory - after_memory
+    
+    logger.info(f"垃圾回收完成: 收集了 {collected} 个对象, 释放了 {memory_freed:.2f}% 内存")
+    return collected, memory_freed
+
+
+# 新增函数：检查是否需要执行垃圾回收
+async def check_and_perform_gc():
+    """检查是否需要执行垃圾回收"""
+    global last_api_call_time
+    
+    current_time = time.time()
+    time_since_last_call = current_time - last_api_call_time
+    
+    # 如果距离上次API调用超过了GC_INTERVAL，并且内存使用超过阈值，则执行垃圾回收
+    if time_since_last_call > GC_INTERVAL:
+        memory_usage = get_memory_usage()
+        if memory_usage > MEMORY_THRESHOLD:
+            logger.info(f"执行计划垃圾回收: 距上次API调用 {time_since_last_call:.2f}秒, 内存使用 {memory_usage:.2f}%")
+            perform_garbage_collection()
+        else:
+            logger.info(f"跳过垃圾回收: 内存使用 {memory_usage:.2f}% 低于阈值 {MEMORY_THRESHOLD}%")
+
+
+# 新增函数：更新最后API调用时间
+def update_last_api_call_time():
+    """更新最后API调用时间"""
     global last_api_call_time
     last_api_call_time = time.time()
+
+
+# 新增函数：后台垃圾回收任务
+async def background_gc_task():
+    """后台垃圾回收任务"""
+    while True:
+        await check_and_perform_gc()
+        await asyncio.sleep(GC_INTERVAL)  # 每隔GC_INTERVAL秒检查一次
+
+
+@app.get("/")
+async def hff(background_tasks: BackgroundTasks):
+    update_last_api_call_time()
+    background_tasks.add_task(check_and_perform_gc)
+    return {"status": "ok", "提示": "hefengfan接口已成功部署！"}
+
+
+@app.get("/v1/models")
+async def list_models(background_tasks: BackgroundTasks):
+    """列出可用模型"""
+    update_last_api_call_time()
+    background_tasks.add_task(check_and_perform_gc)
     
     current_time = int(time.time())
     models_data = [
@@ -662,25 +619,22 @@ async def list_models():
 
     return {"object": "list", "data": models_data}
 
+
 @app.post("/v1/chat/completions")
-async def chat_completions(request: ChatCompletionRequest, authorization: str = Header(None), req: Request = None):
-    """Process chat completion requests with memory optimization"""
-    # Update last API call time
-    global last_api_call_time
-    last_api_call_time = time.time()
+async def chat_completions(request: ChatCompletionRequest, authorization: str = Header(None), background_tasks: BackgroundTasks):
+    """处理聊天完成请求"""
+    # 更新最后API调用时间
+    update_last_api_call_time()
     
-    # Verify API key
+    # 验证 API 密钥
     await verify_api_key(authorization)
 
-    # Add request log
+    # 添加请求日志
     logger.info(f"Received chat request: model={request.model}, stream={request.stream}")
     messages = [msg.model_dump() for msg in request.messages]
 
-    # Get client from app state
-    client = req.app.state.http_client if hasattr(req.app.state, 'http_client') else None
-
     if not request.stream:
-        # Non-streaming response processing
+        # 非流式响应处理
         content = ""
         thinking_content = ""
         meta = None
@@ -690,12 +644,11 @@ async def chat_completions(request: ChatCompletionRequest, authorization: str = 
                 messages=messages,
                 model=request.model,
                 temperature=request.temperature,
-                stream=True,  # Still use streaming internally
+                stream=True,  # 内部仍使用流式处理
                 max_tokens=request.max_tokens,
                 presence_penalty=request.presence_penalty,
                 frequency_penalty=request.frequency_penalty,
-                top_p=request.top_p,
-                client=client
+                top_p=request.top_p
         ):
             try:
                 if chunk_str.startswith("data: ") and not chunk_str.startswith("data: [DONE]"):
@@ -705,7 +658,7 @@ async def chat_completions(request: ChatCompletionRequest, authorization: str = 
                         if "content" in delta:
                             content_part = delta["content"]
 
-                            # Process thinking block markers
+                            # 处理思考块标记
                             if content_part == "<Thinking>\n\n":
                                 in_thinking = True
                                 continue
@@ -713,22 +666,22 @@ async def chat_completions(request: ChatCompletionRequest, authorization: str = 
                                 in_thinking = False
                                 continue
 
-                            # Collect content
+                            # 收集内容
                             if in_thinking:
                                 thinking_content += content_part
                             else:
                                 content += content_part
 
-                        # Collect metadata
+                        # 收集元数据
                         if "meta" in delta:
                             meta = delta["meta"]
             except Exception as e:
-                logger.error(f"Error processing non-streaming response: {e}")
+                logger.error(f"处理非流式响应错误: {e}")
 
-        # Clean any reference tags from final content
-        content = clean_reference_tags(content)
+        # 清理引用标记
+        content = clean_reference_annotations(content)
         
-        # Build complete response
+        # 构建完整响应
         return {
             "id": str(uuid.uuid4()),
             "object": "chat.completion",
@@ -737,7 +690,7 @@ async def chat_completions(request: ChatCompletionRequest, authorization: str = 
             "choices": [{
                 "message": {
                     "role": "assistant",
-                    "reasoning_content": f"<Thinking>\n{thinking_content}\n</Thinking>" if thinking_content else None,
+                    "reasoning_content": f"<Thinking>\n\{thinking_content\}\n</Thinking>" if thinking_content else None,
                     "content": content,
                     "meta": meta
                 },
@@ -745,7 +698,7 @@ async def chat_completions(request: ChatCompletionRequest, authorization: str = 
             }]
         }
 
-    # Streaming response
+    # 流式响应
     return StreamingResponse(
         generate_response(
             messages=messages,
@@ -755,34 +708,56 @@ async def chat_completions(request: ChatCompletionRequest, authorization: str = 
             max_tokens=request.max_tokens,
             presence_penalty=request.presence_penalty,
             frequency_penalty=request.frequency_penalty,
-            top_p=request.top_p,
-            client=client
+            top_p=request.top_p
         ),
         media_type="text/event-stream"
     )
 
+
+@app.on_event("startup")
+async def startup_event():
+    """应用启动时初始化会话"""
+    try:
+        session_manager.initialize()
+        # 启动后台垃圾回收任务
+        asyncio.create_task(background_gc_task())
+        logger.info("后台垃圾回收任务已启动")
+    except Exception as e:
+        logger.error(f"启动初始化错误: {e}")
+        raise
+
+
 @app.get("/health")
 async def health_check(background_tasks: BackgroundTasks):
-    """Health check endpoint with garbage collection"""
-    # Run garbage collection in the background
-    background_tasks.add_task(gc.collect)
+    """健康检查端点"""
+    update_last_api_call_time()
+    background_tasks.add_task(check_and_perform_gc)
     
+    memory_usage = get_memory_usage()
     if session_manager.is_initialized():
-        return {"status": "ok", "session": "active", "last_api_call": time.time() - last_api_call_time}
+        return {
+            "status": "ok", 
+            "session": "active",
+            "memory_usage": f"{memory_usage:.2f}%",
+            "last_api_call": datetime.datetime.fromtimestamp(last_api_call_time).strftime('%Y-%m-%d %H:%M:%S')
+        }
     else:
-        return {"status": "degraded", "session": "inactive", "last_api_call": time.time() - last_api_call_time}
+        return {
+            "status": "degraded", 
+            "session": "inactive",
+            "memory_usage": f"{memory_usage:.2f}%",
+            "last_api_call": datetime.datetime.fromtimestamp(last_api_call_time).strftime('%Y-%m-%d %H:%M:%S')
+        }
 
-@app.get("/gc")
-async def force_garbage_collection():
-    """Force garbage collection"""
-    before = gc.get_count()
-    collected = gc.collect(generation=2)
-    after = gc.get_count()
-    
+
+# 添加手动触发垃圾回收的端点
+@app.post("/maintenance/gc")
+async def trigger_garbage_collection():
+    """手动触发垃圾回收"""
+    collected, memory_freed = perform_garbage_collection()
     return {
-        "status": "ok", 
-        "collected": collected,
-        "before": before,
-        "after": after,
-        "last_api_call": time.time() - last_api_call_time
+        "status": "ok",
+        "collected_objects": collected,
+        "memory_freed_percent": f"{memory_freed:.2f}%",
+        "current_memory_usage": f"{get_memory_usage():.2f}%"
     }
