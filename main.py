@@ -6,8 +6,9 @@ import datetime
 import time
 import re
 import gc
-import psutil
 import threading
+import os
+import sys
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -55,8 +56,7 @@ class MemoryManager:
         """Monitor memory usage and trigger cleanup when necessary"""
         while self.is_running:
             try:
-                memory_info = psutil.virtual_memory()
-                memory_percent = memory_info.percent
+                memory_percent = self.get_memory_usage()
                 
                 logger.info(f"Current memory usage: {memory_percent:.1f}%")
                 
@@ -68,6 +68,50 @@ class MemoryManager:
                 logger.error(f"Error in memory monitoring: {e}")
                 
             time.sleep(self.check_interval)
+    
+    def get_memory_usage(self):
+        """Get current memory usage percentage using built-in methods"""
+        try:
+            # Try to use resource module (Unix-like systems)
+            import resource
+            usage = resource.getrusage(resource.RUSAGE_SELF)
+            # Convert to MB (ru_maxrss is in KB on Linux, bytes on macOS)
+            if sys.platform == 'darwin':  # macOS
+                mem_used = usage.ru_maxrss / 1024 / 1024
+            else:  # Linux
+                mem_used = usage.ru_maxrss / 1024
+                
+            # Get total memory from /proc/meminfo on Linux
+            total_mem = self._get_total_memory()
+            if total_mem > 0:
+                return (mem_used / total_mem) * 100
+            
+            # Fallback: estimate based on process size relative to expected total
+            # Assuming the server has 500MB as mentioned
+            return (mem_used / 500) * 100
+            
+        except ImportError:
+            # Fallback for systems without resource module
+            # Use a simple heuristic based on available objects
+            gc.collect()  # Collect first to get accurate count
+            obj_count = len(gc.get_objects())
+            # Rough estimate - adjust threshold based on testing
+            threshold = 1000000  # Arbitrary large number of objects
+            return (obj_count / threshold) * 100
+    
+    def _get_total_memory(self):
+        """Get total system memory in MB"""
+        try:
+            # Try to read from /proc/meminfo on Linux
+            if os.path.exists('/proc/meminfo'):
+                with open('/proc/meminfo', 'r') as f:
+                    for line in f:
+                        if 'MemTotal' in line:
+                            # Extract value in KB and convert to MB
+                            return int(line.split()[1]) / 1024
+            return 0
+        except:
+            return 0
     
     def cleanup_memory(self):
         """Perform memory cleanup operations"""
@@ -91,8 +135,8 @@ class MemoryManager:
             pass
         
         # Log memory after cleanup
-        memory_info = psutil.virtual_memory()
-        logger.info(f"Memory after cleanup: {memory_info.percent:.1f}%")
+        memory_percent = self.get_memory_usage()
+        logger.info(f"Memory after cleanup: {memory_percent:.1f}%")
 
 # Initialize memory manager
 memory_manager = MemoryManager(threshold_percent=75, check_interval=30)
@@ -293,15 +337,15 @@ def create_conversation(device_id: str, token: str, user_id: str) -> str:
 
 def is_thinking_content(content: str) -> bool:
     """Determine if content is thinking process"""
-    return "\`\`\`ys_think" in content
+    return "```ys_think" in content
 
 
 def clean_thinking_content(content: str) -> str:
     """Clean thinking process content, remove special markers"""
     # Remove entire thinking block
-    if "\`\`\`ys_think" in content:
+    if "```ys_think" in content:
         # Use regex to remove entire thinking block
-        cleaned = re.sub(r'\`\`\`ys_think.*?\`\`\`', '', content, flags=re.DOTALL)
+        cleaned = re.sub(r'```ys_think.*?```', '', content, flags=re.DOTALL)
         # If only whitespace remains after cleaning, return empty string
         if cleaned and cleaned.strip():
             return cleaned.strip()
@@ -367,7 +411,7 @@ async def process_message_event(data: dict, is_first_chunk: bool, in_thinking_bl
     result = ""
 
     # Check if it's the start of a thinking block
-    if "\`\`\`ys_think" in content and not thinking_started:
+    if "```ys_think" in content and not thinking_started:
         thinking_started = True
         in_thinking_block = True
         # Send thinking block start marker
@@ -377,11 +421,11 @@ async def process_message_event(data: dict, is_first_chunk: bool, in_thinking_bl
             content="<Thinking>\n\n",
             is_first=is_first_chunk
         )
-        result = f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+        result = f"data: \{json.dumps(chunk, ensure_ascii=False)\}\n\n"
         return result, in_thinking_block, thinking_started, is_first_chunk, thinking_content
 
     # Check if it's the end of a thinking block
-    if "\`\`\`" in content and in_thinking_block:
+    if "```" in content and in_thinking_block:
         in_thinking_block = False
         # Send thinking block end marker
         chunk = create_chunk(
@@ -435,7 +479,8 @@ def process_generate_end_event(data: dict, in_thinking_block: bool, thinking_con
         end_thinking_chunk = create_chunk(
             sse_id=sse_id,
             created=created,
-            content="\n</Thinking>\n\n"
+            content="\n<Thinking>
+</Thinking>\n\n"
         )
         result.append(f"data: {json.dumps(end_thinking_chunk, ensure_ascii=False)}\n\n")
 
@@ -678,7 +723,7 @@ async def chat_completions(request: ChatCompletionRequest, authorization: str = 
             "choices": [{
                 "message": {
                     "role": "assistant",
-                    "reasoning_content": f"<Thinking>\n{thinking_content}\n</Thinking>" if thinking_content else None,
+                    "reasoning_content": f"<Thinking>\n\{thinking_content\}\n</Thinking>" if thinking_content else None,
                     "content": content,
                     "meta": meta
                 },
@@ -705,28 +750,60 @@ async def chat_completions(request: ChatCompletionRequest, authorization: str = 
 @app.get("/memory")
 async def memory_status():
     """Get memory status"""
-    memory_info = psutil.virtual_memory()
-    return {
-        "total": memory_info.total,
-        "available": memory_info.available,
-        "percent": memory_info.percent,
-        "used": memory_info.used,
-        "free": memory_info.free
-    }
+    try:
+        memory_percent = memory_manager.get_memory_usage()
+        
+        # Get more detailed memory info if possible
+        memory_info = {}
+        try:
+            import resource
+            usage = resource.getrusage(resource.RUSAGE_SELF)
+            if sys.platform == 'darwin':  # macOS
+                memory_info["used_mb"] = usage.ru_maxrss / 1024 / 1024
+            else:  # Linux
+                memory_info["used_mb"] = usage.ru_maxrss / 1024
+                
+            # Try to get total memory from /proc/meminfo on Linux
+            if os.path.exists('/proc/meminfo'):
+                with open('/proc/meminfo', 'r') as f:
+                    for line in f:
+                        if 'MemTotal' in line:
+                            memory_info["total_mb"] = int(line.split()[1]) / 1024
+                        elif 'MemAvailable' in line:
+                            memory_info["available_mb"] = int(line.split()[1]) / 1024
+        except:
+            pass
+            
+        # Get object count
+        gc.collect()
+        memory_info["object_count"] = len(gc.get_objects())
+        
+        return {
+            "percent": memory_percent,
+            "details": memory_info
+        }
+    except Exception as e:
+        logger.error(f"Error getting memory status: {e}")
+        return {"status": "error", "message": str(e)}
 
 
 @app.post("/memory/cleanup")
 async def trigger_cleanup():
     """Manually trigger memory cleanup"""
-    memory_before = psutil.virtual_memory().percent
-    memory_manager.cleanup_memory()
-    memory_after = psutil.virtual_memory().percent
-    return {
-        "status": "success",
-        "memory_before": memory_before,
-        "memory_after": memory_after,
-        "difference": memory_before - memory_after
-    }
+    try:
+        memory_before = memory_manager.get_memory_usage()
+        memory_manager.cleanup_memory()
+        memory_after = memory_manager.get_memory_usage()
+        
+        return {
+            "status": "success",
+            "memory_before": memory_before,
+            "memory_after": memory_after,
+            "difference": memory_before - memory_after
+        }
+    except Exception as e:
+        logger.error(f"Error during memory cleanup: {e}")
+        return {"status": "error", "message": str(e)}
 
 
 @app.on_event("startup")
@@ -745,22 +822,26 @@ async def startup_event():
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
-    memory_info = psutil.virtual_memory()
-    
-    if session_manager.is_initialized():
-        status = "ok"
-        if memory_info.percent > 90:
-            status = "warning"
-            # Trigger cleanup if memory usage is very high
-            memory_manager.cleanup_memory()
-            
-        return {
-            "status": status, 
-            "session": "active",
-            "memory": {
-                "percent": memory_info.percent,
-                "available_mb": memory_info.available / (1024 * 1024)
+    try:
+        memory_percent = memory_manager.get_memory_usage()
+        
+        if session_manager.is_initialized():
+            status = "ok"
+            if memory_percent > 90:
+                status = "warning"
+                # Trigger cleanup if memory usage is very high
+                memory_manager.cleanup_memory()
+                
+            return {
+                "status": status, 
+                "session": "active",
+                "memory": {
+                    "percent": memory_percent,
+                    "monitoring_active": memory_manager.is_running
+                }
             }
-        }
-    else:
-        return {"status": "degraded", "session": "inactive"}
+        else:
+            return {"status": "degraded", "session": "inactive"}
+    except Exception as e:
+        logger.error(f"Health check error: {e}")
+        return {"status": "error", "message": str(e)}
