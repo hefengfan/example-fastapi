@@ -5,7 +5,6 @@ import uuid
 import datetime
 import time
 import re
-import gc
 from fastapi import FastAPI, HTTPException, Header, BackgroundTasks
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -15,22 +14,37 @@ import logging
 import hashlib
 import base64
 import hmac
-import uvicorn
+from starlette.middleware.cors import CORSMiddleware
+import gc
+from contextlib import asynccontextmanager
 
-# Configure logging to be minimal to save memory
-logging.basicConfig(level=logging.WARNING)
+# Configure logging
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Create FastAPI app with optimized settings
-app = FastAPI(
-    title="Optimized API Proxy",
-    description="Memory-optimized FastAPI application",
-    docs_url=None,  # Disable Swagger UI to save memory
-    redoc_url=None  # Disable ReDoc to save memory
-)
+# Global cache for responses and session data
+response_cache = {}
+last_activity_time = time.time()
+CACHE_CLEANUP_INTERVAL = 3600  # 1 hour in seconds
+CACHE_MAX_AGE = 7200  # 2 hours in seconds
 
-# Add CORS middleware with minimal settings
-from fastapi.middleware.cors import CORSMiddleware
+# Lifespan context manager for FastAPI
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Start background tasks
+    cleanup_task = asyncio.create_task(periodic_cache_cleanup())
+    yield
+    # Cleanup on shutdown
+    cleanup_task.cancel()
+    try:
+        await cleanup_task
+    except asyncio.CancelledError:
+        pass
+
+# Create FastAPI app with lifespan
+app = FastAPI(lifespan=lifespan)
+
+# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -39,16 +53,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Add configuration class to manage API configuration
+# Configuration class
 class Config:
     API_KEY = "TkoWuEN8cpDJubb7Zfwxln16NQDZIc8z"
     BASE_URL = "https://api-bj.wenxiaobai.com/api/v1.0"
     BOT_ID = 200006
     DEFAULT_MODEL = "DeepSeek-R1"
-    # Memory optimization settings
-    GARBAGE_COLLECTION_INTERVAL = 300  # 5 minutes
-    LAST_REQUEST_TIME = time.time()
-    MAX_CONCURRENT_REQUESTS = 10  # Limit concurrent requests
 
 
 # Session manager with memory optimization
@@ -58,16 +68,23 @@ class SessionManager:
         self.token = None
         self.user_id = None
         self.conversation_id = None
+        self.last_used = time.time()
         self._client = None
-        self._last_used = time.time()
-
+        
+    @property
+    async def client(self):
+        """Lazy-loaded HTTP client"""
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=httpx.Timeout(150))
+        return self._client
+        
     def initialize(self):
         """Initialize session"""
         self.device_id = generate_device_id()
         self.token, self.user_id = get_auth_token(self.device_id)
         self.conversation_id = create_conversation(self.device_id, self.token, self.user_id)
-        self._last_used = time.time()
-        logger.warning(f"Session initialized: user_id={self.user_id}, conversation_id={self.conversation_id}")
+        self.last_used = time.time()
+        logger.info(f"Session initialized: user_id={self.user_id}, conversation_id={self.conversation_id}")
 
     def is_initialized(self):
         """Check if session is initialized"""
@@ -75,23 +92,13 @@ class SessionManager:
 
     async def refresh_if_needed(self):
         """Refresh session if needed"""
-        self._last_used = time.time()
+        self.last_used = time.time()
         if not self.is_initialized():
             self.initialize()
-
-    async def get_client(self):
-        """Get or create httpx client with connection pooling"""
-        if self._client is None:
-            # Use connection pooling to reduce memory usage
-            self._client = httpx.AsyncClient(
-                timeout=httpx.Timeout(150),
-                limits=httpx.Limits(max_connections=Config.MAX_CONCURRENT_REQUESTS)
-            )
-        return self._client
-
-    async def cleanup(self):
-        """Clean up resources"""
-        if self._client:
+            
+    async def close(self):
+        """Close HTTP client"""
+        if self._client is not None:
             await self._client.aclose()
             self._client = None
 
@@ -100,14 +107,10 @@ class SessionManager:
 session_manager = SessionManager()
 
 
-# Pydantic models with optimized settings
 class Message(BaseModel):
     role: str
     content: str
     name: Optional[str] = None
-
-    class Config:
-        frozen = True  # Immutable for better memory usage
 
 
 class ChatCompletionRequest(BaseModel):
@@ -122,9 +125,6 @@ class ChatCompletionRequest(BaseModel):
     frequency_penalty: Optional[float] = 0
     user: Optional[str] = None
 
-    class Config:
-        frozen = True  # Immutable for better memory usage
-
 
 class ModelData(BaseModel):
     id: str
@@ -135,11 +135,7 @@ class ModelData(BaseModel):
     root: str
     parent: Optional[str] = None
 
-    class Config:
-        frozen = True  # Immutable for better memory usage
 
-
-# Helper functions
 def generate_device_id() -> str:
     """Generate device ID"""
     return f"{uuid.uuid4().hex}_{int(time.time() * 1000)}_{random.randint(100000, 999999)}"
@@ -226,7 +222,7 @@ def get_auth_token(device_id: str) -> Tuple[str, str]:
     headers = create_common_headers(timestamp, digest)
 
     try:
-        with httpx.Client(timeout=30) as client:
+        with httpx.Client(timeout=300) as client:
             response = client.post(
                 f"{Config.BASE_URL}/user/sessions",
                 headers=headers,
@@ -253,7 +249,7 @@ def create_conversation(device_id: str, token: str, user_id: str) -> str:
     headers = create_common_headers(timestamp, digest, token, device_id)
 
     try:
-        with httpx.Client(timeout=30) as client:
+        with httpx.Client(timeout=300) as client:
             response = client.post(
                 f"{Config.BASE_URL}/core/conversations/users/{user_id}/bots/{Config.BOT_ID}/conversation",
                 headers=headers,
@@ -287,13 +283,14 @@ def clean_thinking_content(content: str) -> str:
     return content
 
 
-# Remove reference numbers from content
-def remove_references(content: str) -> str:
-    """Remove reference numbers like [1](@ref) from content"""
+# Remove reference markers like [1](@ref)
+def remove_reference_markers(content: str) -> str:
+    """Remove reference markers from content"""
+    # Pattern to match [number](@ref) or similar reference markers
     return re.sub(r'\[\d+\]$$@ref$$', '', content)
 
 
-# API key verification
+# Helper function: Verify API key
 async def verify_api_key(authorization: str = Header(None)):
     if not authorization:
         raise HTTPException(status_code=401, detail="Missing API key")
@@ -341,8 +338,8 @@ async def process_message_event(data: dict, is_first_chunk: bool, in_thinking_bl
     sse_id = data.get('sseId', str(uuid.uuid4()))
     result = ""
 
-    # Remove reference numbers
-    content = remove_references(content)
+    # Remove reference markers
+    content = remove_reference_markers(content)
 
     # Check if it's the start of a thinking block
     if "```ys_think" in content and not thinking_started:
@@ -434,13 +431,25 @@ def process_generate_end_event(data: dict, in_thinking_block: bool, thinking_con
     return result
 
 
+# Optimized response generator with memory management
 async def generate_response(messages: List[dict], model: str, temperature: float, stream: bool,
                             max_tokens: Optional[int] = None, presence_penalty: float = 0,
                             frequency_penalty: float = 0, top_p: float = 1.0) -> AsyncGenerator[str, None]:
     """Generate response - using true streaming"""
     # Ensure session is initialized
     await session_manager.refresh_if_needed()
-    Config.LAST_REQUEST_TIME = time.time()
+
+    # Generate cache key
+    cache_key = hashlib.md5(json.dumps(messages).encode()).hexdigest()
+    
+    # Check cache for non-streaming responses
+    if not stream and cache_key in response_cache:
+        cached_response = response_cache[cache_key]
+        if time.time() - cached_response['timestamp'] < 300:  # 5 minutes cache
+            logger.info(f"Cache hit for query: {messages[-1]['content'][:30]}...")
+            for chunk in cached_response['chunks']:
+                yield chunk
+            return
 
     timestamp = generate_timestamp()
     payload = {
@@ -495,9 +504,12 @@ async def generate_response(messages: List[dict], model: str, temperature: float
         'x-yuanshi-appversionname': '3.1.0',
     })
 
+    # For caching non-streaming responses
+    cached_chunks = []
+
     try:
         # Use stream=True parameter for true streaming
-        client = await session_manager.get_client()
+        client = await session_manager.client
         async with client.stream('POST', f"{Config.BASE_URL}/core/conversation/chat/v1",
                                 headers=headers, content=data) as response:
             response.raise_for_status()
@@ -532,55 +544,113 @@ async def generate_response(messages: List[dict], model: str, temperature: float
                                 data, is_first_chunk, in_thinking_block, thinking_started, thinking_content
                             )
                             if result:
+                                if not stream:
+                                    cached_chunks.append(result)
                                 yield result
 
                         # Process generation end event
                         elif current_event == "generateEnd":
                             for chunk in process_generate_end_event(data, in_thinking_block, thinking_content):
+                                if not stream:
+                                    cached_chunks.append(chunk)
                                 yield chunk
 
                     except json.JSONDecodeError as e:
-                        logger.error(f"JSON parsing error: {e}")
+                        logger.error(f"JSON parse error: {e}")
                         continue
+
+        # Cache the response for non-streaming requests
+        if not stream and cached_chunks:
+            response_cache[cache_key] = {
+                'timestamp': time.time(),
+                'chunks': cached_chunks
+            }
+            
+        # Force garbage collection after response generation
+        gc.collect()
 
     except httpx.RequestError as e:
         logger.error(f"Error generating response: {e}")
         # Try to reinitialize session
         try:
             session_manager.initialize()
-            logger.warning("Session reinitialized")
+            logger.info("Session reinitialized")
         except Exception as re_init_error:
             logger.error(f"Failed to reinitialize session: {re_init_error}")
         raise HTTPException(status_code=500, detail=f"Request error: {str(e)}")
 
 
-# Garbage collection task
-async def run_garbage_collection():
-    """Run garbage collection to free memory"""
+# Periodic cache cleanup
+async def periodic_cache_cleanup():
+    """Periodically clean up cache based on time"""
+    global last_activity_time
+    
+    while True:
+        try:
+            await asyncio.sleep(60)  # Check every minute
+            
+            current_time = time.time()
+            # If no activity for CACHE_CLEANUP_INTERVAL, clean up cache
+            if current_time - last_activity_time > CACHE_CLEANUP_INTERVAL:
+                logger.info("Performing cache cleanup due to inactivity")
+                cleanup_cache()
+                
+            # Also clean up old cache entries
+            cleanup_old_cache_entries()
+                
+        except asyncio.CancelledError:
+            logger.info("Cache cleanup task cancelled")
+            break
+        except Exception as e:
+            logger.error(f"Error in cache cleanup: {e}")
+            await asyncio.sleep(300)  # Wait 5 minutes before retrying
+
+
+def cleanup_cache():
+    """Clean up cache and force garbage collection"""
+    global response_cache
+    
+    # Clear response cache
+    response_cache.clear()
+    
+    # Force garbage collection
     gc.collect()
-    logger.warning("Garbage collection completed")
+    
+    logger.info("Cache cleaned up and garbage collected")
 
 
-# Check if garbage collection is needed
-async def check_and_run_gc(background_tasks: BackgroundTasks):
-    """Check if garbage collection is needed and run if necessary"""
+def cleanup_old_cache_entries():
+    """Clean up old cache entries"""
+    global response_cache
+    
     current_time = time.time()
-    if current_time - Config.LAST_REQUEST_TIME > Config.GARBAGE_COLLECTION_INTERVAL:
-        background_tasks.add_task(run_garbage_collection)
-        logger.warning("Scheduled garbage collection")
+    keys_to_remove = []
+    
+    # Find old cache entries
+    for key, entry in response_cache.items():
+        if current_time - entry['timestamp'] > CACHE_MAX_AGE:
+            keys_to_remove.append(key)
+    
+    # Remove old entries
+    for key in keys_to_remove:
+        del response_cache[key]
+    
+    if keys_to_remove:
+        logger.info(f"Removed {len(keys_to_remove)} old cache entries")
 
 
 @app.get("/")
-async def hff(background_tasks: BackgroundTasks):
-    await check_and_run_gc(background_tasks)
+async def hff():
+    global last_activity_time
+    last_activity_time = time.time()
     return {"status": "ok", "提示": "hefengfan接口已成功部署！"}
 
 
-@app.get("/v1/models", response_model=Dict[str, Any])
-async def list_models(background_tasks: BackgroundTasks):
+@app.get("/v1/models")
+async def list_models():
     """List available models"""
-    await check_and_run_gc(background_tasks)
-    Config.LAST_REQUEST_TIME = time.time()
+    global last_activity_time
+    last_activity_time = time.time()
     
     current_time = int(time.time())
     models_data = [
@@ -610,14 +680,16 @@ async def list_models(background_tasks: BackgroundTasks):
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(request: ChatCompletionRequest, authorization: str = Header(None), background_tasks: BackgroundTasks):
+async def chat_completions(request: ChatCompletionRequest, background_tasks: BackgroundTasks, authorization: str = Header(None)):
     """Process chat completion requests"""
+    global last_activity_time
+    last_activity_time = time.time()
+    
     # Verify API key
     await verify_api_key(authorization)
-    Config.LAST_REQUEST_TIME = time.time()
 
     # Add request log
-    logger.warning(f"Received chat request: model={request.model}, stream={request.stream}")
+    logger.info(f"Received chat request: model={request.model}, stream={request.stream}")
     messages = [msg.model_dump() for msg in request.messages]
 
     if not request.stream:
@@ -645,7 +717,7 @@ async def chat_completions(request: ChatCompletionRequest, authorization: str = 
                         if "content" in delta:
                             content_part = delta["content"]
 
-                            # Process thinking block markers
+                            # Handle thinking block markers
                             if content_part == "<Thinking>\n\n":
                                 in_thinking = True
                                 continue
@@ -665,6 +737,9 @@ async def chat_completions(request: ChatCompletionRequest, authorization: str = 
             except Exception as e:
                 logger.error(f"Error processing non-streaming response: {e}")
 
+        # Schedule garbage collection in background
+        background_tasks.add_task(gc.collect)
+        
         # Build complete response
         return {
             "id": str(uuid.uuid4()),
@@ -703,44 +778,30 @@ async def startup_event():
     """Initialize session on application startup"""
     try:
         session_manager.initialize()
-        # Start background task for periodic garbage collection
-        asyncio.create_task(periodic_garbage_collection())
     except Exception as e:
         logger.error(f"Startup initialization error: {e}")
         raise
 
 
-async def periodic_garbage_collection():
-    """Periodically run garbage collection"""
-    while True:
-        current_time = time.time()
-        if current_time - Config.LAST_REQUEST_TIME > Config.GARBAGE_COLLECTION_INTERVAL:
-            logger.warning("Running periodic garbage collection")
-            gc.collect()
-        await asyncio.sleep(Config.GARBAGE_COLLECTION_INTERVAL)
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Clean up resources on application shutdown"""
-    await session_manager.cleanup()
-
-
 @app.get("/health")
-async def health_check(background_tasks: BackgroundTasks):
+async def health_check():
     """Health check endpoint"""
-    await check_and_run_gc(background_tasks)
+    global last_activity_time
+    last_activity_time = time.time()
+    
     if session_manager.is_initialized():
-        return {"status": "ok", "session": "active", "memory_usage": f"{get_memory_usage()} MB"}
+        return {
+            "status": "ok", 
+            "session": "active",
+            "cache_size": len(response_cache),
+            "last_activity": datetime.datetime.fromtimestamp(last_activity_time).isoformat()
+        }
     else:
-        return {"status": "degraded", "session": "inactive", "memory_usage": f"{get_memory_usage()} MB"}
+        return {"status": "degraded", "session": "inactive"}
 
 
-def get_memory_usage():
-    """Get current memory usage in MB"""
-    import psutil
-    process = psutil.Process()
-    memory_info = process.memory_info()
-    return round(memory_info.rss / (1024 * 1024), 2)
-
-
+@app.get("/clear-cache")
+async def clear_cache():
+    """Manually clear cache"""
+    cleanup_cache()
+    return {"status": "ok", "message": "Cache cleared successfully"}
