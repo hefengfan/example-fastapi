@@ -386,7 +386,7 @@ def clean_ai_response(content: str) -> str:
     content = re.sub(r'\[\d+\]$$@ref$$', '', content)
     
     # Remove thinking blocks
-    content = re.sub(r'```ys_think.*?```', '', content, flags=re.DOTALL)
+    content = re.sub(r'\`\`\`ys_think.*?\`\`\`', '', content, flags=re.DOTALL)
     
     # Clean up extra whitespace
     content = re.sub(r'\n\s*\n\s*\n', '\n\n', content)
@@ -456,15 +456,15 @@ async def process_message_event(data: dict, is_first_chunk: bool, in_thinking_bl
     result = ""
 
     # Check for thinking block start
-    if "```ys_think" in content and not thinking_started:
+    if "\`\`\`ys_think" in content and not thinking_started:
         thinking_started = True
         in_thinking_block = True
         chunk = create_chunk(sse_id=sse_id, created=created, content="<Thinking>\n\n", is_first=is_first_chunk)
-        result = f"data: \{json.dumps(chunk, ensure_ascii=False)\}\n\n"
+        result = f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
         return result, in_thinking_block, thinking_started, is_first_chunk, thinking_content
 
     # Check for thinking block end
-    if "```" in content and in_thinking_block:
+    if "\`\`\`" in content and in_thinking_block:
         in_thinking_block = False
         chunk = create_chunk(sse_id=sse_id, created=created, content="\n</Thinking>\n\n")
         result = f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
@@ -724,7 +724,7 @@ async def chat_completions(request: ChatCompletionRequest, authorization: str = 
             "choices": [{
                 "message": {
                     "role": "assistant",
-                    "reasoning_content": f"<Thinking>\n\{thinking_content\}\n</Thinking>" if thinking_content else None,
+                    "reasoning_content": f"<Thinking>\n{thinking_content}\n</Thinking>" if thinking_content else None,
                     "content": content,
                     "meta": meta
                 },
