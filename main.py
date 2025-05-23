@@ -9,14 +9,14 @@ import gc
 import threading
 import os
 import sys
-from fastapi import FastAPI, HTTPException, Header
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
-from typing import List, Optional, Dict, Any, AsyncGenerator, Tuple
+import base64
+from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Form, Body, Request
+from fastapi.responses import StreamingResponse, JSONResponse
+from pydantic import BaseModel, Field
+from typing import List, Optional, Dict, Any, AsyncGenerator, Tuple, Union
 import httpx
 import logging
 import hashlib
-import base64
 import hmac
 
 logging.basicConfig(level=logging.INFO)
@@ -147,6 +147,97 @@ class Config:
     BASE_URL = "https://api-bj.wenxiaobai.com/api/v1.0"
     BOT_ID = 200006
     DEFAULT_MODEL = "DeepSeek-R1"
+    # File storage directory for uploaded files
+    UPLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "uploads")
+
+
+# File storage manager
+class FileManager:
+    def __init__(self):
+        # Create upload directory if it doesn't exist
+        os.makedirs(Config.UPLOAD_DIR, exist_ok=True)
+        self.files = {}  # Map file IDs to metadata
+        
+    async def save_file(self, file: UploadFile) -> Dict[str, Any]:
+        """Save an uploaded file and return metadata"""
+        file_id = f"file-{uuid.uuid4()}"
+        timestamp = int(time.time())
+        
+        # Create file path
+        filename = file.filename or f"unnamed-{timestamp}"
+        file_path = os.path.join(Config.UPLOAD_DIR, f"{file_id}-{filename}")
+        
+        # Save file content
+        content = await file.read()
+        with open(file_path, "wb") as f:
+            f.write(content)
+            
+        # Extract text content if possible
+        text_content = await self._extract_text(file_path, file.content_type)
+        
+        # Create metadata
+        metadata = {
+            "id": file_id,
+            "object": "file",
+            "bytes": len(content),
+            "created_at": timestamp,
+            "filename": filename,
+            "purpose": "assistants",
+            "status": "processed",
+            "path": file_path,
+            "content_type": file.content_type,
+            "text_content": text_content
+        }
+        
+        # Store metadata
+        self.files[file_id] = metadata
+        return metadata
+    
+    async def _extract_text(self, file_path: str, content_type: str) -> Optional[str]:
+        """Extract text from file if possible"""
+        try:
+            if content_type.startswith("text/"):
+                with open(file_path, "r", encoding="utf-8") as f:
+                    return f.read()
+            elif content_type == "application/json":
+                with open(file_path, "r", encoding="utf-8") as f:
+                    return f.read()
+            # Add more content type handlers as needed
+            return None
+        except Exception as e:
+            logger.error(f"Error extracting text from file: {e}")
+            return None
+    
+    def get_file(self, file_id: str) -> Optional[Dict[str, Any]]:
+        """Get file metadata by ID"""
+        return self.files.get(file_id)
+    
+    def list_files(self) -> List[Dict[str, Any]]:
+        """List all files"""
+        return list(self.files.values())
+    
+    def delete_file(self, file_id: str) -> bool:
+        """Delete a file"""
+        if file_id in self.files:
+            metadata = self.files[file_id]
+            try:
+                os.remove(metadata["path"])
+                del self.files[file_id]
+                return True
+            except Exception as e:
+                logger.error(f"Error deleting file: {e}")
+        return False
+    
+    def get_file_content(self, file_id: str) -> Optional[str]:
+        """Get text content of a file"""
+        metadata = self.get_file(file_id)
+        if metadata and metadata.get("text_content"):
+            return metadata["text_content"]
+        return None
+
+
+# Initialize file manager
+file_manager = FileManager()
 
 
 # Add session management class
@@ -195,6 +286,8 @@ class ChatCompletionRequest(BaseModel):
     presence_penalty: Optional[float] = 0
     frequency_penalty: Optional[float] = 0
     user: Optional[str] = None
+    file_ids: Optional[List[str]] = None
+
 
 class ModelData(BaseModel):
     id: str
@@ -204,6 +297,16 @@ class ModelData(BaseModel):
     permission: List[Dict[str, Any]] = []
     root: str
     parent: Optional[str] = None
+
+
+class FileUploadResponse(BaseModel):
+    id: str
+    object: str = "file"
+    bytes: int
+    created_at: int
+    filename: str
+    purpose: str
+    status: str = "processed"
 
 
 def generate_device_id() -> str:
@@ -357,7 +460,8 @@ def clean_thinking_content(content: str) -> str:
 def remove_reference_annotations(content: str) -> str:
     """Remove reference annotations like [1](@ref) from content"""
     # Pattern to match [number](@ref) or similar reference annotations
-    pattern = r'\[\d+\]$$@ref$$'
+    # This improved pattern handles variations in the reference format
+    pattern = r'\[\d+\](?:$$@ref$$|$$\@ref$$|$$[@]ref$$)'
     cleaned_content = re.sub(pattern, '', content)
     return cleaned_content
 
@@ -504,17 +608,24 @@ def process_generate_end_event(data: dict, in_thinking_block: bool, thinking_con
 
 async def generate_response(messages: List[dict], model: str, temperature: float, stream: bool,
                             max_tokens: Optional[int] = None, presence_penalty: float = 0,
-                            frequency_penalty: float = 0, top_p: float = 1.0) -> AsyncGenerator[str, None]:
+                            frequency_penalty: float = 0, top_p: float = 1.0,
+                            file_contents: Optional[str] = None) -> AsyncGenerator[str, None]:
     """Generate response - using true streaming"""
     # Ensure session is initialized
     await session_manager.refresh_if_needed()
+
+    # Prepare the query - include file contents if provided
+    query = messages[-1]['content']
+    if file_contents:
+        # Add file contents as context
+        query = f"Context from uploaded files:\n{file_contents}\n\nUser query: {query}"
 
     timestamp = generate_timestamp()
     payload = {
         'userId': session_manager.user_id,
         'botId': Config.BOT_ID,
         'botAlias': 'custom',
-        'query': messages[-1]['content'],
+        'query': query,
         'isRetry': False,
         'breakingStrategy': 0,
         'isNewConversation': True,
@@ -655,15 +766,110 @@ async def list_models():
     return {"object": "list", "data": models_data}
 
 
+@app.post("/v1/files")
+async def upload_file(
+    file: UploadFile = File(...),
+    purpose: str = Form("assistants"),
+    authorization: str = Header(None)
+):
+    """Upload a file (OpenAI compatible endpoint)"""
+    # Verify API key
+    await verify_api_key(authorization)
+    
+    # Save file
+    metadata = await file_manager.save_file(file)
+    
+    # Return response in OpenAI format
+    return FileUploadResponse(
+        id=metadata["id"],
+        bytes=metadata["bytes"],
+        created_at=metadata["created_at"],
+        filename=metadata["filename"],
+        purpose=purpose
+    )
+
+
+@app.get("/v1/files")
+async def list_files(authorization: str = Header(None)):
+    """List all files (OpenAI compatible endpoint)"""
+    # Verify API key
+    await verify_api_key(authorization)
+    
+    # Get all files
+    files = file_manager.list_files()
+    
+    # Convert to OpenAI format
+    response_files = [
+        FileUploadResponse(
+            id=f["id"],
+            bytes=f["bytes"],
+            created_at=f["created_at"],
+            filename=f["filename"],
+            purpose="assistants"
+        ) for f in files
+    ]
+    
+    return {"object": "list", "data": response_files}
+
+
+@app.get("/v1/files/{file_id}")
+async def get_file(file_id: str, authorization: str = Header(None)):
+    """Get file metadata (OpenAI compatible endpoint)"""
+    # Verify API key
+    await verify_api_key(authorization)
+    
+    # Get file metadata
+    metadata = file_manager.get_file(file_id)
+    if not metadata:
+        raise HTTPException(status_code=404, detail="File not found")
+    
+    # Return in OpenAI format
+    return FileUploadResponse(
+        id=metadata["id"],
+        bytes=metadata["bytes"],
+        created_at=metadata["created_at"],
+        filename=metadata["filename"],
+        purpose="assistants"
+    )
+
+
+@app.delete("/v1/files/{file_id}")
+async def delete_file(file_id: str, authorization: str = Header(None)):
+    """Delete a file (OpenAI compatible endpoint)"""
+    # Verify API key
+    await verify_api_key(authorization)
+    
+    # Delete file
+    success = file_manager.delete_file(file_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="File not found")
+    
+    # Return success response
+    return {"id": file_id, "object": "file", "deleted": True}
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest, authorization: str = Header(None)):
-    """Process chat completion requests"""
+    """Process chat completion requests with file support"""
     # Verify API key
     await verify_api_key(authorization)
 
     # Add request log
     logger.info(f"Received chat request: model={request.model}, stream={request.stream}")
     messages = [msg.model_dump() for msg in request.messages]
+    
+    # Process file content if file_ids are provided
+    file_contents = None
+    if request.file_ids:
+        file_texts = []
+        for file_id in request.file_ids:
+            content = file_manager.get_file_content(file_id)
+            if content:
+                file_texts.append(f"--- File: {file_manager.get_file(file_id)['filename']} ---\n{content}\n")
+        
+        if file_texts:
+            file_contents = "\n".join(file_texts)
+            logger.info(f"Added context from {len(file_texts)} files")
 
     if not request.stream:
         # Non-streaming response processing
@@ -680,7 +886,8 @@ async def chat_completions(request: ChatCompletionRequest, authorization: str = 
                 max_tokens=request.max_tokens,
                 presence_penalty=request.presence_penalty,
                 frequency_penalty=request.frequency_penalty,
-                top_p=request.top_p
+                top_p=request.top_p,
+                file_contents=file_contents
         ):
             try:
                 if chunk_str.startswith("data: ") and not chunk_str.startswith("data: [DONE]"):
@@ -740,7 +947,8 @@ async def chat_completions(request: ChatCompletionRequest, authorization: str = 
             max_tokens=request.max_tokens,
             presence_penalty=request.presence_penalty,
             frequency_penalty=request.frequency_penalty,
-            top_p=request.top_p
+            top_p=request.top_p,
+            file_contents=file_contents
         ),
         media_type="text/event-stream"
     )
