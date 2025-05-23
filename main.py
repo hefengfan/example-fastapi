@@ -337,15 +337,15 @@ def create_conversation(device_id: str, token: str, user_id: str) -> str:
 
 def is_thinking_content(content: str) -> bool:
     """Determine if content is thinking process"""
-    return "```ys_think" in content
+    return "\`\`\`ys_think" in content
 
 
 def clean_thinking_content(content: str) -> str:
     """Clean thinking process content, remove special markers"""
     # Remove entire thinking block
-    if "```ys_think" in content:
+    if "\`\`\`ys_think" in content:
         # Use regex to remove entire thinking block
-        cleaned = re.sub(r'```ys_think.*?```', '', content, flags=re.DOTALL)
+        cleaned = re.sub(r'\`\`\`ys_think.*?\`\`\`', '', content, flags=re.DOTALL)
         # If only whitespace remains after cleaning, return empty string
         if cleaned and cleaned.strip():
             return cleaned.strip()
@@ -411,7 +411,7 @@ async def process_message_event(data: dict, is_first_chunk: bool, in_thinking_bl
     result = ""
 
     # Check if it's the start of a thinking block
-    if "```ys_think" in content and not thinking_started:
+    if "\`\`\`ys_think" in content and not thinking_started:
         thinking_started = True
         in_thinking_block = True
         # Send thinking block start marker
@@ -421,11 +421,11 @@ async def process_message_event(data: dict, is_first_chunk: bool, in_thinking_bl
             content="<Thinking>\n\n",
             is_first=is_first_chunk
         )
-        result = f"data: \{json.dumps(chunk, ensure_ascii=False)\}\n\n"
+        result = f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
         return result, in_thinking_block, thinking_started, is_first_chunk, thinking_content
 
     # Check if it's the end of a thinking block
-    if "```" in content and in_thinking_block:
+    if "\`\`\`" in content and in_thinking_block:
         in_thinking_block = False
         # Send thinking block end marker
         chunk = create_chunk(
@@ -479,8 +479,7 @@ def process_generate_end_event(data: dict, in_thinking_block: bool, thinking_con
         end_thinking_chunk = create_chunk(
             sse_id=sse_id,
             created=created,
-            content="\n<Thinking>
-</Thinking>\n\n"
+            content="\n</Thinking>\n\n"
         )
         result.append(f"data: {json.dumps(end_thinking_chunk, ensure_ascii=False)}\n\n")
 
@@ -723,7 +722,7 @@ async def chat_completions(request: ChatCompletionRequest, authorization: str = 
             "choices": [{
                 "message": {
                     "role": "assistant",
-                    "reasoning_content": f"<Thinking>\n\{thinking_content\}\n</Thinking>" if thinking_content else None,
+                    "reasoning_content": f"<Thinking>\n{thinking_content}\n</Thinking>" if thinking_content else None,
                     "content": content,
                     "meta": meta
                 },
@@ -751,59 +750,96 @@ async def chat_completions(request: ChatCompletionRequest, authorization: str = 
 async def memory_status():
     """Get memory status"""
     try:
-        memory_percent = memory_manager.get_memory_usage()
+        import resource
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        if sys.platform == 'darwin':  # macOS
+            mem_used = usage.ru_maxrss / 1024 / 1024
+        else:  # Linux
+            mem_used = usage.ru_maxrss / 1024
         
-        # Get more detailed memory info if possible
-        memory_info = {}
-        try:
-            import resource
-            usage = resource.getrusage(resource.RUSAGE_SELF)
-            if sys.platform == 'darwin':  # macOS
-                memory_info["used_mb"] = usage.ru_maxrss / 1024 / 1024
-            else:  # Linux
-                memory_info["used_mb"] = usage.ru_maxrss / 1024
-                
-            # Try to get total memory from /proc/meminfo on Linux
-            if os.path.exists('/proc/meminfo'):
-                with open('/proc/meminfo', 'r') as f:
-                    for line in f:
-                        if 'MemTotal' in line:
-                            memory_info["total_mb"] = int(line.split()[1]) / 1024
-                        elif 'MemAvailable' in line:
-                            memory_info["available_mb"] = int(line.split()[1]) / 1024
-        except:
-            pass
-            
-        # Get object count
-        gc.collect()
-        memory_info["object_count"] = len(gc.get_objects())
+        # Get total memory if possible
+        total_mem = 0
+        if os.path.exists('/proc/meminfo'):
+            with open('/proc/meminfo', 'r') as f:
+                for line in f:
+                    if 'MemTotal' in line:
+                        total_mem = int(line.split()[1]) / 1024
+                        break
+        
+        # Get free memory if possible
+        free_mem = 0
+        if os.path.exists('/proc/meminfo'):
+            with open('/proc/meminfo', 'r') as f:
+                for line in f:
+                    if 'MemAvailable' in line:
+                        free_mem = int(line.split()[1]) / 1024
+                        break
+        
+        # Calculate percentage if we have total memory
+        percent = (mem_used / total_mem * 100) if total_mem > 0 else 0
         
         return {
-            "percent": memory_percent,
-            "details": memory_info
+            "process_memory_mb": round(mem_used, 2),
+            "total_memory_mb": round(total_mem, 2) if total_mem > 0 else "unknown",
+            "available_memory_mb": round(free_mem, 2) if free_mem > 0 else "unknown",
+            "memory_percent": round(percent, 2) if percent > 0 else "unknown",
+            "gc_objects": len(gc.get_objects())
         }
-    except Exception as e:
-        logger.error(f"Error getting memory status: {e}")
-        return {"status": "error", "message": str(e)}
+    except ImportError:
+        # Fallback if resource module is not available
+        return {
+            "gc_objects": len(gc.get_objects()),
+            "note": "Limited memory information available (resource module not found)"
+        }
 
 
 @app.post("/memory/cleanup")
 async def trigger_cleanup():
     """Manually trigger memory cleanup"""
+    # Get memory before cleanup
     try:
-        memory_before = memory_manager.get_memory_usage()
-        memory_manager.cleanup_memory()
-        memory_after = memory_manager.get_memory_usage()
+        import resource
+        usage_before = resource.getrusage(resource.RUSAGE_SELF)
+        if sys.platform == 'darwin':  # macOS
+            mem_before = usage_before.ru_maxrss / 1024 / 1024
+        else:  # Linux
+            mem_before = usage_before.ru_maxrss / 1024
+    except ImportError:
+        mem_before = 0
+    
+    # Count objects before cleanup
+    obj_count_before = len(gc.get_objects())
+    
+    # Perform cleanup
+    memory_manager.cleanup_memory()
+    
+    # Get memory after cleanup
+    try:
+        import resource
+        usage_after = resource.getrusage(resource.RUSAGE_SELF)
+        if sys.platform == 'darwin':  # macOS
+            mem_after = usage_after.ru_maxrss / 1024 / 1024
+        else:  # Linux
+            mem_after = usage_after.ru_maxrss / 1024
         
-        return {
-            "status": "success",
-            "memory_before": memory_before,
-            "memory_after": memory_after,
-            "difference": memory_before - memory_after
-        }
-    except Exception as e:
-        logger.error(f"Error during memory cleanup: {e}")
-        return {"status": "error", "message": str(e)}
+        mem_diff = mem_before - mem_after
+    except ImportError:
+        mem_after = 0
+        mem_diff = 0
+    
+    # Count objects after cleanup
+    obj_count_after = len(gc.get_objects())
+    obj_diff = obj_count_before - obj_count_after
+    
+    return {
+        "status": "success",
+        "memory_before_mb": round(mem_before, 2) if mem_before > 0 else "unknown",
+        "memory_after_mb": round(mem_after, 2) if mem_after > 0 else "unknown",
+        "memory_difference_mb": round(mem_diff, 2) if mem_diff != 0 else "unknown",
+        "objects_before": obj_count_before,
+        "objects_after": obj_count_after,
+        "objects_difference": obj_diff
+    }
 
 
 @app.on_event("startup")
@@ -823,25 +859,46 @@ async def startup_event():
 async def health_check():
     """Health check endpoint"""
     try:
-        memory_percent = memory_manager.get_memory_usage()
+        # Get memory usage
+        import resource
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        if sys.platform == 'darwin':  # macOS
+            mem_used = usage.ru_maxrss / 1024 / 1024
+        else:  # Linux
+            mem_used = usage.ru_maxrss / 1024
         
-        if session_manager.is_initialized():
-            status = "ok"
-            if memory_percent > 90:
-                status = "warning"
-                # Trigger cleanup if memory usage is very high
-                memory_manager.cleanup_memory()
-                
-            return {
-                "status": status, 
-                "session": "active",
-                "memory": {
-                    "percent": memory_percent,
-                    "monitoring_active": memory_manager.is_running
-                }
+        # Get total memory if possible
+        total_mem = 0
+        if os.path.exists('/proc/meminfo'):
+            with open('/proc/meminfo', 'r') as f:
+                for line in f:
+                    if 'MemTotal' in line:
+                        total_mem = int(line.split()[1]) / 1024
+                        break
+        
+        # Calculate percentage if we have total memory
+        percent = (mem_used / total_mem * 100) if total_mem > 0 else 0
+        
+        # Determine status
+        status = "ok"
+        if percent > 90:
+            status = "warning"
+            # Trigger cleanup if memory usage is very high
+            memory_manager.cleanup_memory()
+    except ImportError:
+        # Fallback if resource module is not available
+        status = "ok"
+        percent = 0
+        mem_used = 0
+    
+    if session_manager.is_initialized():
+        return {
+            "status": status, 
+            "session": "active",
+            "memory": {
+                "percent": round(percent, 2) if percent > 0 else "unknown",
+                "used_mb": round(mem_used, 2) if mem_used > 0 else "unknown"
             }
-        else:
-            return {"status": "degraded", "session": "inactive"}
-    except Exception as e:
-        logger.error(f"Health check error: {e}")
-        return {"status": "error", "message": str(e)}
+        }
+    else:
+        return {"status": "degraded", "session": "inactive"}
