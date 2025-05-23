@@ -293,15 +293,15 @@ def create_conversation(device_id: str, token: str, user_id: str) -> str:
 
 def is_thinking_content(content: str) -> bool:
     """Determine if content is thinking process"""
-    return "```ys_think" in content
+    return "\`\`\`ys_think" in content
 
 
 def clean_thinking_content(content: str) -> str:
     """Clean thinking process content, remove special markers"""
     # Remove entire thinking block
-    if "```ys_think" in content:
+    if "\`\`\`ys_think" in content:
         # Use regex to remove entire thinking block
-        cleaned = re.sub(r'```ys_think.*?```', '', content, flags=re.DOTALL)
+        cleaned = re.sub(r'\`\`\`ys_think.*?\`\`\`', '', content, flags=re.DOTALL)
         # If only whitespace remains after cleaning, return empty string
         if cleaned and cleaned.strip():
             return cleaned.strip()
@@ -367,7 +367,7 @@ async def process_message_event(data: dict, is_first_chunk: bool, in_thinking_bl
     result = ""
 
     # Check if it's the start of a thinking block
-    if "```ys_think" in content and not thinking_started:
+    if "\`\`\`ys_think" in content and not thinking_started:
         thinking_started = True
         in_thinking_block = True
         # Send thinking block start marker
@@ -377,11 +377,11 @@ async def process_message_event(data: dict, is_first_chunk: bool, in_thinking_bl
             content="<Thinking>\n\n",
             is_first=is_first_chunk
         )
-        result = f"data: \{json.dumps(chunk, ensure_ascii=False)\}\n\n"
+        result = f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
         return result, in_thinking_block, thinking_started, is_first_chunk, thinking_content
 
     # Check if it's the end of a thinking block
-    if "```" in content and in_thinking_block:
+    if "\`\`\`" in content and in_thinking_block:
         in_thinking_block = False
         # Send thinking block end marker
         chunk = create_chunk(
@@ -406,7 +406,7 @@ async def process_message_event(data: dict, is_first_chunk: bool, in_thinking_bl
 
     # Clean content, remove thinking block
     content = clean_thinking_content(content)
-    if not content:  # Skip if content is empty after cleaning
+    if not content:  # If content is empty after cleaning, skip
         return result, in_thinking_block, thinking_started, is_first_chunk, thinking_content
 
     # Remove reference annotations
@@ -435,8 +435,7 @@ def process_generate_end_event(data: dict, in_thinking_block: bool, thinking_con
         end_thinking_chunk = create_chunk(
             sse_id=sse_id,
             created=created,
-            content="\n<Thinking>
-</Thinking>\n\n"
+            content="\n</Thinking>\n\n"
         )
         result.append(f"data: {json.dumps(end_thinking_chunk, ensure_ascii=False)}\n\n")
 
@@ -564,11 +563,11 @@ async def generate_response(messages: List[dict], model: str, temperature: float
                                     yield chunk
 
                         except json.JSONDecodeError as e:
-                            logger.error(f"JSON parsing error: {e}")
+                            logger.error(f"JSON parse error: {e}")
                             continue
 
     except httpx.RequestError as e:
-        logger.error(f"Error generating response: {e}")
+        logger.error(f"Generate response error: {e}")
         # Try to reinitialize session
         try:
             session_manager.initialize()
@@ -614,7 +613,7 @@ async def list_models():
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest, authorization: str = Header(None)):
-    """Process chat completion request"""
+    """Process chat completion requests"""
     # Verify API key
     await verify_api_key(authorization)
 
@@ -667,6 +666,9 @@ async def chat_completions(request: ChatCompletionRequest, authorization: str = 
             except Exception as e:
                 logger.error(f"Error processing non-streaming response: {e}")
 
+        # Remove reference annotations from final content
+        content = remove_reference_annotations(content)
+
         # Build complete response
         return {
             "id": str(uuid.uuid4()),
@@ -676,7 +678,7 @@ async def chat_completions(request: ChatCompletionRequest, authorization: str = 
             "choices": [{
                 "message": {
                     "role": "assistant",
-                    "reasoning_content": f"<Thinking>\n\{thinking_content\}\n</Thinking>" if thinking_content else None,
+                    "reasoning_content": f"<Thinking>\n{thinking_content}\n</Thinking>" if thinking_content else None,
                     "content": content,
                     "meta": meta
                 },
@@ -700,52 +702,16 @@ async def chat_completions(request: ChatCompletionRequest, authorization: str = 
     )
 
 
-@app.on_event("startup")
-async def startup_event():
-    """Initialize session on application startup"""
-    try:
-        session_manager.initialize()
-        # Start memory monitoring
-        memory_manager.start_monitoring()
-    except Exception as e:
-        logger.error(f"Startup initialization error: {e}")
-        raise
-
-
-@app.get("/health")
-async def health_check():
-    """Health check endpoint"""
-    # Get current memory usage
-    memory_info = psutil.virtual_memory()
-    memory_percent = memory_info.percent
-    
-    if session_manager.is_initialized():
-        return {
-            "status": "ok", 
-            "session": "active",
-            "memory_usage": f"{memory_percent:.1f}%"
-        }
-    else:
-        return {
-            "status": "degraded", 
-            "session": "inactive",
-            "memory_usage": f"{memory_percent:.1f}%"
-        }
-
-
-@app.get("/memory/status")
+@app.get("/memory")
 async def memory_status():
-    """Get memory status and trigger manual cleanup if needed"""
+    """Get memory status"""
     memory_info = psutil.virtual_memory()
-    
     return {
-        "total": f"{memory_info.total / (1024 * 1024):.2f} MB",
-        "available": f"{memory_info.available / (1024 * 1024):.2f} MB",
-        "used": f"{memory_info.used / (1024 * 1024):.2f} MB",
-        "percent": f"{memory_info.percent:.1f}%",
-        "monitoring_active": memory_manager.is_running,
-        "threshold": f"{memory_manager.threshold_percent}%",
-        "check_interval": f"{memory_manager.check_interval} seconds"
+        "total": memory_info.total,
+        "available": memory_info.available,
+        "percent": memory_info.percent,
+        "used": memory_info.used,
+        "free": memory_info.free
     }
 
 
@@ -755,12 +721,46 @@ async def trigger_cleanup():
     memory_before = psutil.virtual_memory().percent
     memory_manager.cleanup_memory()
     memory_after = psutil.virtual_memory().percent
-    
     return {
         "status": "success",
-        "memory_before": f"{memory_before:.1f}%",
-        "memory_after": f"{memory_after:.1f}%",
-        "difference": f"{memory_before - memory_after:.1f}%"
+        "memory_before": memory_before,
+        "memory_after": memory_after,
+        "difference": memory_before - memory_after
     }
 
-# Run with: uvicorn memory_optimized_server:app --host 0.0.0.0 --port 8000
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize session on application startup"""
+    try:
+        session_manager.initialize()
+        # Start memory monitoring
+        memory_manager.start_monitoring()
+        logger.info("Application started with memory monitoring")
+    except Exception as e:
+        logger.error(f"Startup initialization error: {e}")
+        raise
+
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    memory_info = psutil.virtual_memory()
+    
+    if session_manager.is_initialized():
+        status = "ok"
+        if memory_info.percent > 90:
+            status = "warning"
+            # Trigger cleanup if memory usage is very high
+            memory_manager.cleanup_memory()
+            
+        return {
+            "status": status, 
+            "session": "active",
+            "memory": {
+                "percent": memory_info.percent,
+                "available_mb": memory_info.available / (1024 * 1024)
+            }
+        }
+    else:
+        return {"status": "degraded", "session": "inactive"}
