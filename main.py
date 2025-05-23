@@ -17,8 +17,6 @@ import hmac
 from starlette.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import gc
-import psutil
-import threading
 
 # Configure logging with minimal overhead
 logging.basicConfig(
@@ -28,51 +26,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Track API activity for memory management
-class APIActivityTracker:
-    def __init__(self):
-        self.last_activity = time.time()
-        self.is_active = False
-        self.lock = threading.Lock()
-        
-    def record_activity(self):
-        with self.lock:
-            self.last_activity = time.time()
-            self.is_active = True
-            
-    def mark_inactive(self):
-        with self.lock:
-            self.is_active = False
-            
-    def get_idle_time(self):
-        with self.lock:
-            return time.time() - self.last_activity
-
-# Create activity tracker
-activity_tracker = APIActivityTracker()
-
-# Memory cleanup task
-async def cleanup_memory():
-    """Background task to clean up memory when API is idle"""
-    while True:
-        # Only clean up if API has been idle for more than 60 seconds
-        if not activity_tracker.is_active and activity_tracker.get_idle_time() > 60:
-            logger.info("Performing memory cleanup due to inactivity")
-            gc.collect()
-            
-            # More aggressive cleanup on Linux systems
-            if hasattr(gc, "freeze"):
-                gc.freeze()
-            
-            # On Linux, you can use this to release memory back to the OS
-            try:
-                import ctypes
-                libc = ctypes.CDLL('libc.so.6')
-                libc.malloc_trim(0)
-            except:
-                pass
-            
-        await asyncio.sleep(30)  # Check every 30 seconds
+# Track last API call time for garbage collection
+last_api_call_time = time.time()
+gc_interval = 300  # 5 minutes
 
 # Use lifespan for more efficient resource management
 @asynccontextmanager
@@ -81,21 +37,52 @@ async def lifespan(app: FastAPI):
     client = httpx.AsyncClient(timeout=httpx.Timeout(150), limits=httpx.Limits(max_keepalive_connections=5, max_connections=10))
     app.state.http_client = client
     
+    # Start background garbage collection task
+    app.state.gc_task = asyncio.create_task(periodic_garbage_collection(app))
+    
     # Initialize session on startup
     try:
         await session_manager.refresh_if_needed(client)
     except Exception as e:
         logger.error(f"Startup initialization error: {e}")
     
-    # Start memory cleanup task
-    cleanup_task = asyncio.create_task(cleanup_memory())
-    
     yield
     
     # Clean up resources on shutdown
-    cleanup_task.cancel()
+    app.state.gc_task.cancel()
+    try:
+        await app.state.gc_task
+    except asyncio.CancelledError:
+        pass
+    
     await client.aclose()
     gc.collect()  # Force garbage collection
+
+# Periodic garbage collection function
+async def periodic_garbage_collection(app):
+    """Background task to periodically clean up memory when idle"""
+    while True:
+        try:
+            await asyncio.sleep(60)  # Check every minute
+            current_time = time.time()
+            global last_api_call_time
+            
+            # If no API calls for gc_interval seconds, run garbage collection
+            if current_time - last_api_call_time > gc_interval:
+                logger.info("Server idle, running garbage collection")
+                gc.collect()
+                
+                # Also close and recreate HTTP client if it's been idle too long
+                if hasattr(app.state, 'http_client'):
+                    old_client = app.state.http_client
+                    app.state.http_client = httpx.AsyncClient(
+                        timeout=httpx.Timeout(150), 
+                        limits=httpx.Limits(max_keepalive_connections=5, max_connections=10)
+                    )
+                    await old_client.aclose()
+        except Exception as e:
+            logger.error(f"Error in garbage collection task: {e}")
+            await asyncio.sleep(60)  # Wait before retrying
 
 # Create FastAPI app with lifespan
 app = FastAPI(lifespan=lifespan)
@@ -115,10 +102,6 @@ class Config:
     BASE_URL = "https://api-bj.wenxiaobai.com/api/v1.0"
     BOT_ID = 200006
     DEFAULT_MODEL = "DeepSeek-R1"
-    # Maximum number of messages to include in context
-    MAX_CONTEXT_MESSAGES = 10
-    # Memory cleanup threshold (MB)
-    MEMORY_CLEANUP_THRESHOLD = 400
 
 # Optimized session manager with minimal state
 class SessionManager:
@@ -129,7 +112,6 @@ class SessionManager:
         self.conversation_id = None
         self.last_refresh = 0
         self.refresh_interval = 3600  # Refresh token every hour
-        self.context_history = []  # Store conversation history
 
     def is_initialized(self):
         """Check if session is initialized"""
@@ -156,24 +138,10 @@ class SessionManager:
             self.device_id = generate_device_id()
             self.token, self.user_id = await get_auth_token(self.device_id, client)
             self.conversation_id = await create_conversation(self.device_id, self.token, self.user_id, client)
-            # Reset context history on new session
-            self.context_history = []
             logger.info(f"Session initialized: user_id={self.user_id}, conversation_id={self.conversation_id}")
         finally:
             if close_client:
                 await client.aclose()
-    
-    def update_context(self, messages):
-        """Update context history with new messages"""
-        # Add new messages to context history
-        for msg in messages:
-            if msg not in self.context_history:
-                self.context_history.append(msg)
-        
-        # Limit context history size
-        if len(self.context_history) > Config.MAX_CONTEXT_MESSAGES:
-            # Keep the first message (system prompt) and the most recent messages
-            self.context_history = [self.context_history[0]] + self.context_history[-(Config.MAX_CONTEXT_MESSAGES-1):]
 
 # Create session manager instance
 session_manager = SessionManager()
@@ -339,8 +307,8 @@ def clean_thinking_content(content: str) -> str:
         return ""
     return content
 
-def clean_reference_markers(content: str) -> str:
-    """Remove reference markers like [这是一个数字](@ref) from content"""
+def clean_reference_tags(content: str) -> str:
+    """Remove reference tags like [这是一个数字](@ref) from content"""
     # Remove patterns like [text](@ref)
     cleaned = re.sub(r'\[[^\]]*\]$$@ref$$', '', content)
     return cleaned
@@ -353,9 +321,10 @@ def create_chunk(sse_id: str, created: int, content: Optional[str] = None,
     delta = {}
 
     if content is not None:
-        # Clean reference markers from content
-        content = clean_reference_markers(content)
-        
+        # Clean reference tags from content
+        if content:
+            content = clean_reference_tags(content)
+            
         if is_first:
             delta = {"role": "assistant", "content": content}
         else:
@@ -384,6 +353,9 @@ async def process_message_event(data: dict, is_first_chunk: bool, in_thinking_bl
     created = int(timestamp) // 1000 if timestamp else int(time.time())
     sse_id = data.get('sseId', str(uuid.uuid4()))
     result = ""
+
+    # Clean reference tags from content
+    content = clean_reference_tags(content)
 
     # Check if it's the start of a thinking block
     if "\`\`\`ys_think" in content and not thinking_started:
@@ -423,10 +395,8 @@ async def process_message_event(data: dict, is_first_chunk: bool, in_thinking_bl
         result = f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
         return result, in_thinking_block, thinking_started, is_first_chunk, thinking_content
 
-    # Clean content, remove thinking blocks and reference markers
+    # Clean content, remove thinking blocks
     content = clean_thinking_content(content)
-    content = clean_reference_markers(content)
-    
     if not content:  # Skip if content is empty after cleaning
         return result, in_thinking_block, thinking_started, is_first_chunk, thinking_content
 
@@ -485,26 +455,31 @@ async def verify_api_key(authorization: str = Header(None)):
         raise HTTPException(status_code=401, detail="Invalid API key")
     return api_key
 
-# Function to build context-aware query
-def build_context_aware_query(messages: List[dict]) -> str:
-    """Build a context-aware query that includes relevant conversation history"""
-    # Get the latest user message
-    latest_message = messages[-1]['content']
+# Format conversation history for better context understanding
+def format_conversation_history(messages: List[dict]) -> str:
+    """Format the conversation history to improve context understanding"""
+    formatted_history = []
     
-    # If we have context history, include it in the query
-    if len(session_manager.context_history) > 1:  # More than just the system message
-        # Format previous exchanges as context
-        context_str = "\n\n前面的对话内容：\n"
-        for i, msg in enumerate(session_manager.context_history):
-            if i == 0 and msg['role'] == 'system':
-                continue  # Skip system message in context summary
-            role_prefix = "用户: " if msg['role'] == 'user' else "AI: "
-            context_str += f"{role_prefix}{msg['content']}\n"
+    for msg in messages:
+        role = msg.get('role', '')
+        content = msg.get('content', '')
         
-        # Combine context with the latest query
-        return f"{context_str}\n\n用户的新问题: {latest_message}"
+        if role == 'system':
+            formatted_history.append(f"System: {content}")
+        elif role == 'user':
+            formatted_history.append(f"User: {content}")
+        elif role == 'assistant':
+            formatted_history.append(f"Assistant: {content}")
     
-    return latest_message
+    # Get the last user message separately (will be used as the main query)
+    last_user_message = ""
+    for msg in reversed(messages):
+        if msg.get('role') == 'user':
+            last_user_message = msg.get('content', '')
+            break
+    
+    # Return both the formatted history and the last user message
+    return "\n\n".join(formatted_history), last_user_message
 
 # Optimized response generation
 async def generate_response(messages: List[dict], model: str, temperature: float, stream: bool,
@@ -512,8 +487,9 @@ async def generate_response(messages: List[dict], model: str, temperature: float
                             frequency_penalty: float = 0, top_p: float = 1.0, 
                             client=None) -> AsyncGenerator[str, None]:
     """Generate response with true streaming and minimal memory usage"""
-    # Mark API as active
-    activity_tracker.record_activity()
+    # Update last API call time for garbage collection
+    global last_api_call_time
+    last_api_call_time = time.time()
     
     # Ensure session is initialized
     close_client = False
@@ -523,24 +499,21 @@ async def generate_response(messages: List[dict], model: str, temperature: float
     
     try:
         await session_manager.refresh_if_needed(client)
-        
-        # Update context history with new messages
-        session_manager.update_context(messages)
-        
-        # Build context-aware query
-        context_aware_query = build_context_aware_query(messages)
 
+        # Format conversation history for better context understanding
+        conversation_history, last_query = format_conversation_history(messages)
+        
         timestamp = generate_timestamp()
         payload = {
             'userId': session_manager.user_id,
             'botId': Config.BOT_ID,
             'botAlias': 'custom',
-            'query': context_aware_query,  # Use context-aware query
+            'query': last_query,  # Use the last user message as the main query
             'isRetry': False,
             'breakingStrategy': 0,
-            'isNewConversation': False,  # Set to False to maintain context
+            'isNewConversation': True,
             'mediaInfos': [],
-            'turnIndex': len(session_manager.context_history) // 2,  # Approximate turn index
+            'turnIndex': 0,
             'rewriteQuery': '',
             'conversationId': session_manager.conversation_id,
             'capabilities': [
@@ -551,7 +524,7 @@ async def generate_response(messages: List[dict], model: str, temperature: float
                     'icon': 'https://wy-static.wenxiaobai.com/bot-capability/prod/%E6%B7%B1%E5%BA%A6%E6%80%9D%E8%80%83.png',
                     'minAppVersion': '',
                     'title': '深度思考(R1)',
-                    'botId': 210029,
+                    'BotId': 210029,
                     'botDesc': '深度回答这个问题（DeepSeek R1）',
                     'selectedIcon': 'https://wy-static.wenxiaobai.com/bot-capability/prod/%E6%B7%B1%E5%BA%A6%E6%80%9D%E8%80%83%E9%80%89%E4%B8%AD.png',
                     'botIcon': 'https://platform-dev-1319140468.cos.ap-nanjing.myqcloud.com/bot/avatar/2025/02/06/612cbff8-51e6-4c6a-8530-cb551bcfda56.webp',
@@ -571,6 +544,8 @@ async def generate_response(messages: List[dict], model: str, temperature: float
             },
             'inputWay': 'proactive',
             'pureQuery': '',
+            # Add conversation history to help with context
+            'conversationHistory': conversation_history
         }
         data = json.dumps(payload, separators=(',', ':'))
         digest = calculate_sha256(data)
@@ -595,7 +570,6 @@ async def generate_response(messages: List[dict], model: str, temperature: float
             thinking_content = []
             thinking_started = False
             buffer = ""
-            response_content = ""  # Collect full response
 
             async for raw_line in response.aiter_bytes(1024):
                 buffer += raw_line.decode('utf-8', errors='replace')
@@ -624,19 +598,6 @@ async def generate_response(messages: List[dict], model: str, temperature: float
                                 result, in_thinking_block, thinking_started, is_first_chunk, thinking_content = await process_message_event(
                                     data, is_first_chunk, in_thinking_block, thinking_started, thinking_content
                                 )
-                                
-                                # Collect response content for context history
-                                if result and "choices" in json.loads(result[6:]):
-                                    chunk_data = json.loads(result[6:])
-                                    if "choices" in chunk_data and chunk_data["choices"]:
-                                        delta = chunk_data["choices"][0]["delta"]
-                                        if "content" in delta:
-                                            content_part = delta["content"]
-                                            if not (content_part.startswith("<Thinking>") or 
-                                                   content_part.endswith("</Thinking>") or
-                                                   in_thinking_block):
-                                                response_content += content_part
-                                
                                 if result:
                                     yield result
 
@@ -644,15 +605,6 @@ async def generate_response(messages: List[dict], model: str, temperature: float
                             elif current_event == "generateEnd":
                                 for chunk in process_generate_end_event(data, in_thinking_block, thinking_content):
                                     yield chunk
-                                
-                                # Add assistant response to context history
-                                if response_content:
-                                    # Clean any remaining reference markers
-                                    response_content = clean_reference_markers(response_content)
-                                    session_manager.context_history.append({
-                                        "role": "assistant",
-                                        "content": response_content
-                                    })
 
                         except json.JSONDecodeError as e:
                             logger.error(f"JSON parsing error: {e}")
@@ -667,59 +619,22 @@ async def generate_response(messages: List[dict], model: str, temperature: float
             logger.error(f"Failed to reinitialize session: {re_init_error}")
         raise HTTPException(status_code=500, detail=f"Request error: {str(e)}")
     finally:
-        # Mark API as inactive
-        activity_tracker.mark_inactive()
         if close_client:
             await client.aclose()
-
-# Memory monitoring function
-def get_memory_usage():
-    """Get current memory usage in MB"""
-    process = psutil.Process()
-    memory_info = process.memory_info()
-    return memory_info.rss / (1024 * 1024)  # Convert to MB
-
-# Background task to clean memory
-async def clean_memory_if_needed(background_tasks: BackgroundTasks):
-    """Clean memory if usage exceeds threshold"""
-    memory_usage = get_memory_usage()
-    if memory_usage > Config.MEMORY_CLEANUP_THRESHOLD:
-        background_tasks.add_task(force_memory_cleanup)
-
-async def force_memory_cleanup():
-    """Force memory cleanup"""
-    logger.info(f"Forcing memory cleanup. Current usage: {get_memory_usage():.2f} MB")
-    gc.collect()
-    
-    # More aggressive cleanup on Linux systems
-    if hasattr(gc, "freeze"):
-        gc.freeze()
-    
-    # On Linux, you can use this to release memory back to the OS
-    try:
-        import ctypes
-        libc = ctypes.CDLL('libc.so.6')
-        libc.malloc_trim(0)
-    except:
-        pass
-    
-    logger.info(f"Memory cleanup complete. New usage: {get_memory_usage():.2f} MB")
 
 # API endpoints
 @app.get("/")
 async def health(background_tasks: BackgroundTasks):
-    # Check memory and clean if needed
-    await clean_memory_if_needed(background_tasks)
+    # Run garbage collection in the background
+    background_tasks.add_task(gc.collect)
     return {"status": "ok", "message": "hefengfan API successfully deployed!"}
 
 @app.get("/v1/models")
-async def list_models(background_tasks: BackgroundTasks):
+async def list_models():
     """List available models"""
-    # Record API activity
-    activity_tracker.record_activity()
-    
-    # Check memory and clean if needed
-    await clean_memory_if_needed(background_tasks)
+    # Update last API call time
+    global last_api_call_time
+    last_api_call_time = time.time()
     
     current_time = int(time.time())
     models_data = [
@@ -748,15 +663,11 @@ async def list_models(background_tasks: BackgroundTasks):
     return {"object": "list", "data": models_data}
 
 @app.post("/v1/chat/completions")
-async def chat_completions(request: ChatCompletionRequest, authorization: str = Header(None), 
-                          req: Request = None, background_tasks: BackgroundTasks = None):
+async def chat_completions(request: ChatCompletionRequest, authorization: str = Header(None), req: Request = None):
     """Process chat completion requests with memory optimization"""
-    # Record API activity
-    activity_tracker.record_activity()
-    
-    # Check memory and clean if needed
-    if background_tasks:
-        await clean_memory_if_needed(background_tasks)
+    # Update last API call time
+    global last_api_call_time
+    last_api_call_time = time.time()
     
     # Verify API key
     await verify_api_key(authorization)
@@ -814,8 +725,8 @@ async def chat_completions(request: ChatCompletionRequest, authorization: str = 
             except Exception as e:
                 logger.error(f"Error processing non-streaming response: {e}")
 
-        # Clean any reference markers in final content
-        content = clean_reference_markers(content)
+        # Clean any reference tags from final content
+        content = clean_reference_tags(content)
         
         # Build complete response
         return {
@@ -852,52 +763,26 @@ async def chat_completions(request: ChatCompletionRequest, authorization: str = 
 
 @app.get("/health")
 async def health_check(background_tasks: BackgroundTasks):
-    """Health check endpoint with memory stats"""
-    # Check memory and clean if needed
-    await clean_memory_if_needed(background_tasks)
+    """Health check endpoint with garbage collection"""
+    # Run garbage collection in the background
+    background_tasks.add_task(gc.collect)
     
-    memory_usage = get_memory_usage()
-    
-    return {
-        "status": "ok" if session_manager.is_initialized() else "degraded",
-        "session": "active" if session_manager.is_initialized() else "inactive",
-        "memory_usage_mb": round(memory_usage, 2),
-        "context_history_size": len(session_manager.context_history),
-        "last_activity": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(activity_tracker.last_activity))
-    }
+    if session_manager.is_initialized():
+        return {"status": "ok", "session": "active", "last_api_call": time.time() - last_api_call_time}
+    else:
+        return {"status": "degraded", "session": "inactive", "last_api_call": time.time() - last_api_call_time}
 
-@app.post("/maintenance/cleanup")
-async def force_cleanup(authorization: str = Header(None)):
-    """Force memory cleanup endpoint"""
-    # Verify API key
-    await verify_api_key(authorization)
-    
-    before_memory = get_memory_usage()
-    await force_memory_cleanup()
-    after_memory = get_memory_usage()
+@app.get("/gc")
+async def force_garbage_collection():
+    """Force garbage collection"""
+    before = gc.get_count()
+    collected = gc.collect(generation=2)
+    after = gc.get_count()
     
     return {
-        "status": "success",
-        "memory_before_mb": round(before_memory, 2),
-        "memory_after_mb": round(after_memory, 2),
-        "memory_saved_mb": round(before_memory - after_memory, 2)
-    }
-
-@app.post("/maintenance/reset-context")
-async def reset_context(authorization: str = Header(None)):
-    """Reset conversation context"""
-    # Verify API key
-    await verify_api_key(authorization)
-    
-    # Save first message if it's a system message
-    system_message = None
-    if session_manager.context_history and session_manager.context_history[0]['role'] == 'system':
-        system_message = session_manager.context_history[0]
-    
-    # Reset context
-    session_manager.context_history = [system_message] if system_message else []
-    
-    return {
-        "status": "success",
-        "message": "Conversation context has been reset"
+        "status": "ok", 
+        "collected": collected,
+        "before": before,
+        "after": after,
+        "last_api_call": time.time() - last_api_call_time
     }
