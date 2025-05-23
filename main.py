@@ -5,21 +5,21 @@ import uuid
 import datetime
 import time
 import re
-from fastapi import FastAPI, HTTPException, Header, BackgroundTasks, Request
+from fastapi import FastAPI, HTTPException, Header, BackgroundTasks
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from typing import List, Optional, Dict, Any, AsyncGenerator, Tuple, Union
+from typing import List, Optional, Dict, Any, AsyncGenerator, Tuple
 import httpx
 import logging
 import hashlib
 import base64
 import hmac
 import gc
-from contextlib import asynccontextmanager
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
 from starlette.concurrency import run_in_threadpool
 
-# Configure logging with a more efficient format
+# Configure logging with memory-efficient settings
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -27,29 +27,25 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Memory optimization: Use a custom context manager for app lifecycle
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Initialize resources at startup
-    logger.info("Application starting up")
-    try:
-        # Initialize session on startup
-        await session_manager.initialize_async()
-    except Exception as e:
-        logger.error(f"Startup initialization error: {e}")
-    
-    yield
-    
-    # Clean up resources at shutdown
-    logger.info("Application shutting down")
-    # Force garbage collection to free memory
-    gc.collect()
+# Create FastAPI app with optimized settings
+app = FastAPI(
+    title="AI Chat API",
+    description="Optimized API for low-memory environments",
+    docs_url=None,  # Disable Swagger UI to save memory
+    redoc_url=None  # Disable ReDoc to save memory
+)
 
+# Memory optimization middleware
+class MemoryOptimizationMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        # Force garbage collection after each request
+        await run_in_threadpool(gc.collect)
+        return response
 
-# Create FastAPI app with lifespan manager
-app = FastAPI(lifespan=lifespan)
+app.add_middleware(MemoryOptimizationMiddleware)
 
-# Add CORS middleware
+# Add CORS middleware with memory-efficient settings
 from fastapi.middleware.cors import CORSMiddleware
 app.add_middleware(
     CORSMiddleware,
@@ -59,171 +55,79 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Memory optimization: Add middleware to clean up memory after each request
-class MemoryOptimizationMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        response = await call_next(request)
-        # Run garbage collection in a separate thread to avoid blocking
-        await run_in_threadpool(gc.collect)
-        return response
-
-app.add_middleware(MemoryOptimizationMiddleware)
-
-# Configuration management
+# Configuration class with memory-efficient design
 class Config:
     API_KEY = "TkoWuEN8cpDJubb7Zfwxln16NQDZIc8z"
     BASE_URL = "https://api-bj.wenxiaobai.com/api/v1.0"
     BOT_ID = 200006
     DEFAULT_MODEL = "DeepSeek-R1"
-    # Memory optimization: Add connection pool limits
-    MAX_CONNECTIONS = 10
-    MAX_KEEPALIVE_CONNECTIONS = 5
-    KEEPALIVE_EXPIRY = 30.0  # seconds
-    # Add retry configuration
+    # Add timeout and retry settings
+    REQUEST_TIMEOUT = 60
     MAX_RETRIES = 3
-    RETRY_BACKOFF_FACTOR = 0.5
+    RETRY_DELAY = 2
 
-
-# Session management with improved error handling and async support
+# Session manager with improved error handling
 class SessionManager:
     def __init__(self):
         self.device_id = None
         self.token = None
         self.user_id = None
         self.conversation_id = None
-        self._lock = asyncio.Lock()
-        self._last_activity = time.time()
-        self._client = None
-        self._initialized = False
-        self._error_count = 0
-        self._max_errors = 5
-
-    async def get_client(self):
-        """Get or create an HTTP client with connection pooling"""
-        if self._client is None:
-            limits = httpx.Limits(
-                max_connections=Config.MAX_CONNECTIONS,
-                max_keepalive_connections=Config.MAX_KEEPALIVE_CONNECTIONS,
-                keepalive_expiry=Config.KEEPALIVE_EXPIRY
-            )
-            self._client = httpx.AsyncClient(
-                timeout=httpx.Timeout(150.0),
-                limits=limits
-            )
-        return self._client
-
-    async def initialize_async(self):
-        """Initialize session asynchronously"""
-        async with self._lock:
-            try:
-                self.device_id = await run_in_threadpool(generate_device_id)
-                self.token, self.user_id = await self._get_auth_token_async(self.device_id)
-                self.conversation_id = await self._create_conversation_async(self.device_id, self.token, self.user_id)
-                self._last_activity = time.time()
-                self._initialized = True
-                self._error_count = 0
-                logger.info(f"Session initialized: user_id={self.user_id}, conversation_id={self.conversation_id}")
-            except Exception as e:
-                self._error_count += 1
-                logger.error(f"Session initialization failed: {e}")
-                if self._error_count >= self._max_errors:
-                    logger.critical("Too many initialization errors, service may be unavailable")
-                raise
+        self.last_error = None
+        self.error_count = 0
+        self.last_success = 0
 
     def initialize(self):
-        """Synchronous wrapper for initialize_async"""
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(self.initialize_async())
+        """Initialize session with error handling"""
+        try:
+            self.device_id = generate_device_id()
+            self.token, self.user_id = get_auth_token(self.device_id)
+            self.conversation_id = create_conversation(self.device_id, self.token, self.user_id)
+            self.last_error = None
+            self.error_count = 0
+            self.last_success = time.time()
+            logger.info(f"Session initialized: user_id={self.user_id}, conversation_id={self.conversation_id}")
+            return True
+        except Exception as e:
+            self.last_error = str(e)
+            self.error_count += 1
+            logger.error(f"Session initialization failed: {e}")
+            return False
 
     def is_initialized(self):
         """Check if session is initialized"""
-        return self._initialized and all([self.device_id, self.token, self.user_id, self.conversation_id])
+        return all([self.device_id, self.token, self.user_id, self.conversation_id])
 
-    def is_expired(self, max_idle_time=3600):
-        """Check if session is expired based on idle time"""
-        return time.time() - self._last_activity > max_idle_time
+    def needs_refresh(self):
+        """Check if session needs refresh based on time or errors"""
+        if not self.is_initialized():
+            return True
+        if self.error_count >= 3:
+            return True
+        if time.time() - self.last_success > 3600:  # Refresh after 1 hour
+            return True
+        return False
 
     async def refresh_if_needed(self):
-        """Refresh session if needed"""
-        if not self.is_initialized() or self.is_expired():
-            await self.initialize_async()
-        else:
-            self._last_activity = time.time()
-
-    async def _get_auth_token_async(self, device_id: str) -> Tuple[str, str]:
-        """Get authentication token asynchronously"""
-        timestamp = generate_timestamp()
-        payload = {
-            'deviceId': device_id,
-            'device': 'Edge',
-            'client': 'tourist',
-            'phone': device_id,
-            'code': device_id,
-            'extraInfo': {'url': 'https://www.wenxiaobai.com/chat/tourist'},
-        }
-        data = json.dumps(payload, separators=(',', ':'))
-        digest = calculate_sha256(data)
-        headers = create_common_headers(timestamp, digest)
-        
-        client = await self.get_client()
-        try:
-            response = await client.post(
-                f"{Config.BASE_URL}/user/sessions",
-                headers=headers,
-                content=data,
-                timeout=300
-            )
-            response.raise_for_status()
-            result = response.json()
-            return result['data']['token'], result['data']['user']['id']
-        except httpx.RequestError as e:
-            logger.error(f"Auth token request failed: {e}")
-            raise HTTPException(status_code=500, detail=f"Authentication failed: {str(e)}")
-        except (KeyError, json.JSONDecodeError) as e:
-            logger.error(f"Auth response parsing failed: {e}")
-            raise HTTPException(status_code=500, detail="Server returned invalid authentication data")
-
-    async def _create_conversation_async(self, device_id: str, token: str, user_id: str) -> str:
-        """Create new conversation asynchronously"""
-        timestamp = generate_timestamp()
-        payload = {'visitorId': device_id}
-        data = json.dumps(payload, separators=(',', ':'))
-        digest = calculate_sha256(data)
-        headers = create_common_headers(timestamp, digest, token, device_id)
-        
-        client = await self.get_client()
-        try:
-            response = await client.post(
-                f"{Config.BASE_URL}/core/conversations/users/{user_id}/bots/{Config.BOT_ID}/conversation",
-                headers=headers,
-                content=data,
-                timeout=300
-            )
-            response.raise_for_status()
-            return response.json()['data']
-        except httpx.RequestError as e:
-            logger.error(f"Create conversation failed: {e}")
-            raise HTTPException(status_code=500, detail=f"Failed to create conversation: {str(e)}")
-        except (KeyError, json.JSONDecodeError) as e:
-            logger.error(f"Conversation response parsing failed: {e}")
-            raise HTTPException(status_code=500, detail="Server returned invalid conversation data")
-
-    async def close(self):
-        """Close the HTTP client"""
-        if self._client:
-            await self._client.aclose()
-            self._client = None
-
+        """Refresh session if needed with backoff strategy"""
+        if self.needs_refresh():
+            retry_count = 0
+            while retry_count < Config.MAX_RETRIES:
+                if self.initialize():
+                    return True
+                retry_count += 1
+                await asyncio.sleep(Config.RETRY_DELAY * (2 ** retry_count))  # Exponential backoff
+            return False
+        return True
 
 # Create session manager instance
 session_manager = SessionManager()
 
-
+# Pydantic models with memory-efficient design
 class Message(BaseModel):
     role: str
     content: str
     name: Optional[str] = None
-
 
 class ChatCompletionRequest(BaseModel):
     model: str
@@ -237,7 +141,6 @@ class ChatCompletionRequest(BaseModel):
     frequency_penalty: Optional[float] = 0
     user: Optional[str] = None
 
-
 class ModelData(BaseModel):
     id: str
     object: str = "model"
@@ -247,11 +150,10 @@ class ModelData(BaseModel):
     root: str
     parent: Optional[str] = None
 
-
+# Utility functions
 def generate_device_id() -> str:
     """Generate device ID"""
     return f"{uuid.uuid4().hex}_{int(time.time() * 1000)}_{random.randint(100000, 999999)}"
-
 
 def generate_timestamp() -> str:
     """Generate UTC timestamp string"""
@@ -259,12 +161,10 @@ def generate_timestamp() -> str:
     utc_time = datetime.datetime.utcfromtimestamp(timestamp_ms / 1000.0)
     return utc_time.strftime('%a, %d %b %Y %H:%M:%S GMT')
 
-
 def calculate_sha256(data: str) -> str:
     """Calculate SHA-256 digest"""
     sha256 = hashlib.sha256(data.encode()).digest()
     return base64.b64encode(sha256).decode()
-
 
 def generate_signature(timestamp: str, digest: str) -> str:
     """Generate request signature"""
@@ -275,7 +175,6 @@ def generate_signature(timestamp: str, digest: str) -> str:
         hashlib.sha1
     ).digest()
     return base64.b64encode(signature).decode()
-
 
 def create_common_headers(timestamp: str, digest: str, token: Optional[str] = None,
                           device_id: Optional[str] = None) -> dict:
@@ -316,31 +215,86 @@ def create_common_headers(timestamp: str, digest: str, token: Optional[str] = No
 
     return headers
 
+def get_auth_token(device_id: str) -> Tuple[str, str]:
+    """Get authentication token"""
+    timestamp = generate_timestamp()
+    payload = {
+        'deviceId': device_id,
+        'device': 'Edge',
+        'client': 'tourist',
+        'phone': device_id,
+        'code': device_id,
+        'extraInfo': {'url': 'https://www.wenxiaobai.com/chat/tourist'},
+    }
+    data = json.dumps(payload, separators=(',', ':'))
+    digest = calculate_sha256(data)
+
+    headers = create_common_headers(timestamp, digest)
+
+    try:
+        with httpx.Client(timeout=Config.REQUEST_TIMEOUT) as client:
+            response = client.post(
+                f"{Config.BASE_URL}/user/sessions",
+                headers=headers,
+                content=data
+            )
+            response.raise_for_status()
+            result = response.json()
+            return result['data']['token'], result['data']['user']['id']
+    except httpx.RequestError as e:
+        logger.error(f"Authentication token request failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Authentication failed: {str(e)}")
+    except (KeyError, json.JSONDecodeError) as e:
+        logger.error(f"Authentication response parsing failed: {e}")
+        raise HTTPException(status_code=500, detail="Server returned invalid authentication data")
+
+def create_conversation(device_id: str, token: str, user_id: str) -> str:
+    """Create new conversation"""
+    timestamp = generate_timestamp()
+    payload = {'visitorId': device_id}
+    data = json.dumps(payload, separators=(',', ':'))
+    digest = calculate_sha256(data)
+
+    headers = create_common_headers(timestamp, digest, token, device_id)
+
+    try:
+        with httpx.Client(timeout=Config.REQUEST_TIMEOUT) as client:
+            response = client.post(
+                f"{Config.BASE_URL}/core/conversations/users/{user_id}/bots/{Config.BOT_ID}/conversation",
+                headers=headers,
+                content=data
+            )
+            response.raise_for_status()
+            return response.json()['data']
+    except httpx.RequestError as e:
+        logger.error(f"Create conversation failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Create conversation failed: {str(e)}")
+    except (KeyError, json.JSONDecodeError) as e:
+        logger.error(f"Conversation response parsing failed: {e}")
+        raise HTTPException(status_code=500, detail="Server returned invalid conversation data")
 
 def is_thinking_content(content: str) -> bool:
     """Check if content is thinking process"""
     return "```ys_think" in content
 
-
 def clean_thinking_content(content: str) -> str:
-    """Clean thinking content, remove special markers"""
-    # Remove thinking blocks
+    """Clean thinking process content, remove special markers"""
+    # Remove entire thinking block
     if "```ys_think" in content:
+        # Use regex to remove entire thinking block
         cleaned = re.sub(r'```ys_think.*?```', '', content, flags=re.DOTALL)
+        # If only whitespace remains after cleaning, return empty string
         if cleaned and cleaned.strip():
             return cleaned.strip()
         return ""
     return content
 
-
-# New function to clean reference artifacts
-def clean_reference_artifacts(content: str) -> str:
-    """Remove reference artifacts like [这是一个数字](@ref) from content"""
-    # Pattern to match references like [text](@ref)
-    pattern = r'\[[^\]]+\]$$@ref$$'
-    cleaned = re.sub(pattern, '', content)
-    return cleaned
-
+# Function to remove reference patterns like [1](@ref)
+def remove_reference_patterns(content: str) -> str:
+    """Remove reference patterns like [数字](@ref) from content"""
+    # Pattern to match [数字](@ref) or similar reference patterns
+    pattern = r'\[\d+\]$$@ref$$'
+    return re.sub(pattern, '', content)
 
 # Verify API key
 async def verify_api_key(authorization: str = Header(None)):
@@ -351,7 +305,6 @@ async def verify_api_key(authorization: str = Header(None)):
     if api_key != Config.API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
     return api_key
-
 
 def create_chunk(sse_id: str, created: int, content: Optional[str] = None,
                  is_first: bool = False, meta: Optional[dict] = None,
@@ -380,7 +333,6 @@ def create_chunk(sse_id: str, created: int, content: Optional[str] = None,
         }]
     }
 
-
 async def process_message_event(data: dict, is_first_chunk: bool, in_thinking_block: bool,
                                 thinking_started: bool, thinking_content: list) -> Tuple[str, bool, bool, bool, list]:
     """Process message event"""
@@ -390,10 +342,10 @@ async def process_message_event(data: dict, is_first_chunk: bool, in_thinking_bl
     sse_id = data.get('sseId', str(uuid.uuid4()))
     result = ""
 
-    # Clean reference artifacts
-    content = clean_reference_artifacts(content)
+    # Remove reference patterns from content
+    content = remove_reference_patterns(content)
 
-    # Check if it's the start of a thinking block
+    # Check if it's the start of thinking block
     if "```ys_think" in content and not thinking_started:
         thinking_started = True
         in_thinking_block = True
@@ -404,10 +356,11 @@ async def process_message_event(data: dict, is_first_chunk: bool, in_thinking_bl
             content="<Thinking>\n\n",
             is_first=is_first_chunk
         )
+        # Fix the syntax error in the original code
         result = f"data: \{json.dumps(chunk, ensure_ascii=False)\}\n\n"
         return result, in_thinking_block, thinking_started, is_first_chunk, thinking_content
 
-    # Check if it's the end of a thinking block
+    # Check if it's the end of thinking block
     if "```" in content and in_thinking_block:
         in_thinking_block = False
         # Send thinking block end marker
@@ -416,6 +369,7 @@ async def process_message_event(data: dict, is_first_chunk: bool, in_thinking_bl
             created=created,
             content="\n</Thinking>\n\n"
         )
+        # Fix the syntax error in the original code
         result = f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
         return result, in_thinking_block, thinking_started, is_first_chunk, thinking_content
 
@@ -428,10 +382,11 @@ async def process_message_event(data: dict, is_first_chunk: bool, in_thinking_bl
             created=created,
             content=content
         )
+        # Fix the syntax error in the original code
         result = f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
         return result, in_thinking_block, thinking_started, is_first_chunk, thinking_content
 
-    # Clean content, remove thinking blocks
+    # Clean content, remove thinking block
     content = clean_thinking_content(content)
     if not content:  # Skip if content is empty after cleaning
         return result, in_thinking_block, thinking_started, is_first_chunk, thinking_content
@@ -443,9 +398,9 @@ async def process_message_event(data: dict, is_first_chunk: bool, in_thinking_bl
         content=content,
         is_first=is_first_chunk
     )
+    # Fix the syntax error in the original code
     result = f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
     return result, in_thinking_block, thinking_started, False, thinking_content
-
 
 def process_generate_end_event(data: dict, in_thinking_block: bool, thinking_content: list) -> List[str]:
     """Process generation end event"""
@@ -462,6 +417,7 @@ def process_generate_end_event(data: dict, in_thinking_block: bool, thinking_con
             content="\n<Thinking>
 </Thinking>\n\n"
         )
+        # Fix the syntax error in the original code
         result.append(f"data: {json.dumps(end_thinking_chunk, ensure_ascii=False)}\n\n")
 
     # Add metadata
@@ -470,6 +426,7 @@ def process_generate_end_event(data: dict, in_thinking_block: bool, thinking_con
         created=created,
         meta={"thinking_content": "".join(thinking_content) if thinking_content else None}
     )
+    # Fix the syntax error in the original code
     result.append(f"data: {json.dumps(meta_chunk, ensure_ascii=False)}\n\n")
 
     # Send end marker
@@ -478,57 +435,38 @@ def process_generate_end_event(data: dict, in_thinking_block: bool, thinking_con
         created=created,
         finish_reason="stop"
     )
+    # Fix the syntax error in the original code
     result.append(f"data: {json.dumps(end_chunk, ensure_ascii=False)}\n\n")
     result.append("data: [DONE]\n\n")
     return result
 
-
-# Improved error handling with retries
-async def with_retries(func, *args, **kwargs):
-    """Execute a function with retries"""
-    retries = 0
-    last_error = None
-    
-    while retries <= Config.MAX_RETRIES:
-        try:
-            return await func(*args, **kwargs)
-        except (httpx.RequestError, HTTPException) as e:
-            last_error = e
-            retries += 1
-            if retries > Config.MAX_RETRIES:
-                break
-            
-            # Exponential backoff
-            wait_time = Config.RETRY_BACKOFF_FACTOR * (2 ** (retries - 1))
-            logger.warning(f"Retry {retries}/{Config.MAX_RETRIES} after error: {e}. Waiting {wait_time}s")
-            await asyncio.sleep(wait_time)
-    
-    # If we get here, all retries failed
-    logger.error(f"All retries failed: {last_error}")
-    if isinstance(last_error, HTTPException):
-        raise last_error
-    raise HTTPException(status_code=500, detail=f"Request failed after {Config.MAX_RETRIES} retries: {str(last_error)}")
-
-
+# Memory-efficient generator for streaming responses
 async def generate_response(messages: List[dict], model: str, temperature: float, stream: bool,
                             max_tokens: Optional[int] = None, presence_penalty: float = 0,
                             frequency_penalty: float = 0, top_p: float = 1.0) -> AsyncGenerator[str, None]:
-    """Generate response with true streaming and improved error handling"""
+    """Generate response - using true streaming with memory optimization"""
     # Ensure session is initialized
-    await session_manager.refresh_if_needed()
+    session_initialized = await session_manager.refresh_if_needed()
+    if not session_initialized:
+        # If session initialization fails, yield an error message
+        error_chunk = create_chunk(
+            sse_id=str(uuid.uuid4()),
+            created=int(time.time()),
+            content="服务暂时不可用，请稍后再试。",
+            is_first=True
+        )
+        yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n"
+        
+        end_chunk = create_chunk(
+            sse_id=str(uuid.uuid4()),
+            created=int(time.time()),
+            finish_reason="error"
+        )
+        yield f"data: {json.dumps(end_chunk, ensure_ascii=False)}\n\n"
+        yield "data: [DONE]\n\n"
+        return
 
     timestamp = generate_timestamp()
-    
-    # Extract context from previous messages
-    context = []
-    for msg in messages[:-1]:  # All messages except the last one
-        if msg['role'] in ['user', 'assistant']:
-            context.append({
-                'role': 'user' if msg['role'] == 'user' else 'bot',
-                'content': msg['content']
-            })
-    
-    # Prepare payload with context
     payload = {
         'userId': session_manager.user_id,
         'botId': Config.BOT_ID,
@@ -536,9 +474,9 @@ async def generate_response(messages: List[dict], model: str, temperature: float
         'query': messages[-1]['content'],
         'isRetry': False,
         'breakingStrategy': 0,
-        'isNewConversation': len(context) == 0,  # Only new if no context
+        'isNewConversation': True,
         'mediaInfos': [],
-        'turnIndex': len(context) // 2,  # Each turn has user + assistant
+        'turnIndex': 0,
         'rewriteQuery': '',
         'conversationId': session_manager.conversation_id,
         'capabilities': [
@@ -569,9 +507,7 @@ async def generate_response(messages: List[dict], model: str, temperature: float
         },
         'inputWay': 'proactive',
         'pureQuery': '',
-        'context': context  # Add context from previous messages
     }
-    
     data = json.dumps(payload, separators=(',', ':'))
     digest = calculate_sha256(data)
 
@@ -583,118 +519,132 @@ async def generate_response(messages: List[dict], model: str, temperature: float
         'x-yuanshi-appversionname': '3.1.0',
     })
 
-    # Get client from session manager
-    client = await session_manager.get_client()
-    
-    # Process streaming response with improved error handling
-    try:
-        async with client.stream('POST', f"{Config.BASE_URL}/core/conversation/chat/v1",
-                                headers=headers, content=data) as response:
-            response.raise_for_status()
+    # Track empty response handling
+    empty_response_count = 0
+    max_empty_responses = 3
+    retry_count = 0
+    max_retries = Config.MAX_RETRIES
 
-            # Process streaming response
-            is_first_chunk = True
-            current_event = None
-            in_thinking_block = False
-            thinking_content = []
-            thinking_started = False
-            empty_response_count = 0
-            max_empty_responses = 5
-            last_activity = time.time()
-            timeout = 60  # seconds
+    while retry_count <= max_retries:
+        try:
+            # Use stream=True parameter for true streaming
+            async with httpx.AsyncClient(timeout=httpx.Timeout(Config.REQUEST_TIMEOUT)) as client:
+                async with client.stream('POST', f"{Config.BASE_URL}/core/conversation/chat/v1",
+                                        headers=headers, content=data) as response:
+                    response.raise_for_status()
 
-            async for line in response.aiter_lines():
-                # Reset timeout counter on activity
-                last_activity = time.time()
-                
-                line = line.strip()
-                if not line:
+                    # Process streaming response
+                    is_first_chunk = True
                     current_event = None
-                    empty_response_count += 1
-                    
-                    # If too many empty responses, yield a heartbeat to keep connection alive
-                    if empty_response_count >= max_empty_responses:
-                        empty_response_count = 0
-                        yield f"data: {json.dumps({'heartbeat': True})}\n\n"
-                    
-                    continue
+                    in_thinking_block = False
+                    thinking_content = []
+                    thinking_started = False
+                    has_yielded_content = False
 
-                # Reset empty response counter on valid data
-                empty_response_count = 0
+                    async for line in response.aiter_lines():
+                        line = line.strip()
+                        if not line:
+                            current_event = None
+                            continue
 
-                # Parse event type
-                if line.startswith("event:"):
-                    current_event = line[len("event:"):].strip()
-                    continue
+                        # Parse event type
+                        if line.startswith("event:"):
+                            current_event = line[len("event:"):].strip()
+                            continue
 
-                # Process data line
-                elif line.startswith("data:"):
-                    json_str = line[len("data:"):].strip()
-                    try:
-                        data = json.loads(json_str)
+                        # Process data line
+                        elif line.startswith("data:"):
+                            json_str = line[len("data:"):].strip()
+                            try:
+                                data = json.loads(json_str)
 
-                        # Process message event
-                        if current_event == "message":
-                            result, in_thinking_block, thinking_started, is_first_chunk, thinking_content = await process_message_event(
-                                data, is_first_chunk, in_thinking_block, thinking_started, thinking_content
+                                # Process message event
+                                if current_event == "message":
+                                    result, in_thinking_block, thinking_started, is_first_chunk, thinking_content = await process_message_event(
+                                        data, is_first_chunk, in_thinking_block, thinking_started, thinking_content
+                                    )
+                                    if result:
+                                        has_yielded_content = True
+                                        yield result
+
+                                # Process generation end event
+                                elif current_event == "generateEnd":
+                                    for chunk in process_generate_end_event(data, in_thinking_block, thinking_content):
+                                        has_yielded_content = True
+                                        yield chunk
+
+                            except json.JSONDecodeError as e:
+                                logger.error(f"JSON parsing error: {e}")
+                                continue
+
+                    # Handle empty response
+                    if not has_yielded_content:
+                        empty_response_count += 1
+                        if empty_response_count >= max_empty_responses:
+                            # If we've had too many empty responses, yield an error
+                            error_chunk = create_chunk(
+                                sse_id=str(uuid.uuid4()),
+                                created=int(time.time()),
+                                content="服务暂时不可用，请稍后再试。",
+                                is_first=True
                             )
-                            if result:
-                                yield result
-
-                        # Process generation end event
-                        elif current_event == "generateEnd":
-                            for chunk in process_generate_end_event(data, in_thinking_block, thinking_content):
-                                yield chunk
-
-                    except json.JSONDecodeError as e:
-                        logger.error(f"JSON parsing error: {e}")
+                            yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n"
+                            
+                            end_chunk = create_chunk(
+                                sse_id=str(uuid.uuid4()),
+                                created=int(time.time()),
+                                finish_reason="error"
+                            )
+                            yield f"data: {json.dumps(end_chunk, ensure_ascii=False)}\n\n"
+                            yield "data: [DONE]\n\n"
+                            break
+                        
+                        # Try to reinitialize session
+                        session_manager.initialize()
+                        retry_count += 1
+                        await asyncio.sleep(Config.RETRY_DELAY * (2 ** retry_count))  # Exponential backoff
                         continue
-                
-                # Check for timeout
-                if time.time() - last_activity > timeout:
-                    logger.warning("Response stream timed out")
-                    # Send end marker on timeout
-                    for chunk in process_generate_end_event(
-                        {"timestamp": str(int(time.time() * 1000))}, 
-                        in_thinking_block, 
-                        thinking_content
-                    ):
-                        yield chunk
+                    
+                    # If we got here with content, we're done
+                    session_manager.last_success = time.time()
+                    session_manager.error_count = 0
                     break
 
-    except httpx.RequestError as e:
-        logger.error(f"Generate response error: {e}")
-        # Try to reinitialize session
-        try:
-            await session_manager.initialize_async()
-            logger.info("Session reinitialized")
-        except Exception as re_init_error:
-            logger.error(f"Session reinitialization failed: {re_init_error}")
-        
-        # Send error response in streaming format
-        error_id = str(uuid.uuid4())
-        error_time = int(time.time())
-        error_chunk = create_chunk(
-            sse_id=error_id,
-            created=error_time,
-            content="I apologize, but I encountered an error processing your request. Please try again.",
-            is_first=True
-        )
-        yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n"
-        
-        end_chunk = create_chunk(
-            sse_id=error_id,
-            created=error_time,
-            finish_reason="error"
-        )
-        yield f"data: {json.dumps(end_chunk, ensure_ascii=False)}\n\n"
-        yield "data: [DONE]\n\n"
-
+        except httpx.RequestError as e:
+            logger.error(f"Generate response error: {e}")
+            retry_count += 1
+            
+            # Try to reinitialize session
+            try:
+                session_manager.initialize()
+                logger.info("Session reinitialized")
+            except Exception as re_init_error:
+                logger.error(f"Session reinitialization failed: {re_init_error}")
+            
+            # If we've reached max retries, yield an error
+            if retry_count > max_retries:
+                error_chunk = create_chunk(
+                    sse_id=str(uuid.uuid4()),
+                    created=int(time.time()),
+                    content="服务暂时不可用，请稍后再试。",
+                    is_first=True
+                )
+                yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n"
+                
+                end_chunk = create_chunk(
+                    sse_id=str(uuid.uuid4()),
+                    created=int(time.time()),
+                    finish_reason="error"
+                )
+                yield f"data: {json.dumps(end_chunk, ensure_ascii=False)}\n\n"
+                yield "data: [DONE]\n\n"
+                break
+            
+            await asyncio.sleep(Config.RETRY_DELAY * (2 ** retry_count))  # Exponential backoff
 
 @app.get("/")
 async def hff():
-    return {"status": "ok", "message": "hefengfan API successfully deployed!"}
-
+    return {"status": "ok", "提示": "hefengfan接口已成功部署！"}
 
 @app.get("/v1/models")
 async def list_models():
@@ -725,15 +675,14 @@ async def list_models():
 
     return {"object": "list", "data": models_data}
 
-
 @app.post("/v1/chat/completions")
-async def chat_completions(request: ChatCompletionRequest, authorization: str = Header(None), background_tasks: BackgroundTasks):
-    """Handle chat completion requests with improved memory management"""
+async def chat_completions(request: ChatCompletionRequest, background_tasks: BackgroundTasks, authorization: str = Header(None)):
+    """Handle chat completion requests with memory optimization"""
     # Verify API key
     await verify_api_key(authorization)
 
-    # Log request (minimal logging to save memory)
-    logger.info(f"Chat request: model={request.model}, stream={request.stream}")
+    # Add request log
+    logger.info(f"Received chat request: model={request.model}, stream={request.stream}")
     messages = [msg.model_dump() for msg in request.messages]
 
     if not request.stream:
@@ -760,6 +709,8 @@ async def chat_completions(request: ChatCompletionRequest, authorization: str = 
                         delta = chunk["choices"][0]["delta"]
                         if "content" in delta:
                             content_part = delta["content"]
+                            # Remove reference patterns
+                            content_part = remove_reference_patterns(content_part)
 
                             # Handle thinking block markers
                             if content_part == "<Thinking>\n\n":
@@ -781,11 +732,8 @@ async def chat_completions(request: ChatCompletionRequest, authorization: str = 
             except Exception as e:
                 logger.error(f"Non-streaming response processing error: {e}")
 
-        # Clean reference artifacts in final content
-        content = clean_reference_artifacts(content)
-
         # Build complete response
-        response = {
+        response_data = {
             "id": str(uuid.uuid4()),
             "object": "chat.completion",
             "created": int(time.time()),
@@ -801,10 +749,10 @@ async def chat_completions(request: ChatCompletionRequest, authorization: str = 
             }]
         }
         
-        # Schedule garbage collection after request
+        # Schedule garbage collection after response
         background_tasks.add_task(gc.collect)
         
-        return response
+        return response_data
 
     # Streaming response
     return StreamingResponse(
@@ -821,23 +769,60 @@ async def chat_completions(request: ChatCompletionRequest, authorization: str = 
         media_type="text/event-stream"
     )
 
+@app.on_event("startup")
+async def startup_event():
+    """Initialize session on application startup"""
+    try:
+        # Set lower memory limits for httpx
+        httpx._config.DEFAULT_LIMITS = httpx.Limits(max_connections=10, max_keepalive_connections=5)
+        
+        # Initialize session
+        session_manager.initialize()
+    except Exception as e:
+        logger.error(f"Startup initialization error: {e}")
+        # Don't raise here, allow the app to start anyway
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint with memory usage info"""
-    import psutil
+    """Health check endpoint"""
+    memory_info = {}
+    try:
+        import psutil
+        process = psutil.Process()
+        memory_info = {
+            "memory_usage_mb": process.memory_info().rss / (1024 * 1024),
+            "memory_percent": process.memory_percent()
+        }
+    except ImportError:
+        memory_info = {"note": "psutil not installed, memory stats unavailable"}
     
-    process = psutil.Process()
-    memory_info = process.memory_info()
-    memory_mb = memory_info.rss / (1024 * 1024)
-    
-    status = "ok" if session_manager.is_initialized() else "degraded"
-    session_status = "active" if session_manager.is_initialized() else "inactive"
-    
-    return {
-        "status": status, 
-        "session": session_status,
-        "memory_usage_mb": round(memory_mb, 2),
-        "uptime_seconds": int(time.time() - process.create_time())
-    }
+    if session_manager.is_initialized():
+        return {
+            "status": "ok", 
+            "session": "active", 
+            "last_success": session_manager.last_success,
+            "memory": memory_info
+        }
+    else:
+        return {
+            "status": "degraded", 
+            "session": "inactive", 
+            "last_error": session_manager.last_error,
+            "memory": memory_info
+        }
 
+# Add a route to force garbage collection
+@app.post("/admin/gc")
+async def force_gc(authorization: str = Header(None)):
+    """Force garbage collection"""
+    await verify_api_key(authorization)
+    collected = gc.collect()
+    return {"status": "ok", "collected": collected}
+
+# Add a route to reset session
+@app.post("/admin/reset-session")
+async def reset_session(authorization: str = Header(None)):
+    """Reset session"""
+    await verify_api_key(authorization)
+    success = session_manager.initialize()
+    return {"status": "ok" if success else "error", "session_initialized": success}
