@@ -5,20 +5,21 @@ import uuid
 import datetime
 import time
 import re
-from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi import FastAPI, HTTPException, Header, BackgroundTasks, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
-from typing import List, Optional, Dict, Any, AsyncGenerator, Tuple
+from pydantic import BaseModel
+from typing import List, Optional, Dict, Any, AsyncGenerator, Tuple, Union
 import httpx
 import logging
 import hashlib
 import base64
 import hmac
-from starlette.middleware.cors import CORSMiddleware
-from contextlib import asynccontextmanager
 import gc
+from contextlib import asynccontextmanager
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.concurrency import run_in_threadpool
 
-# Configure logging with minimal overhead
+# Configure logging with a more efficient format
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -26,29 +27,30 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Use lifespan for more efficient resource management
+# Memory optimization: Use a custom context manager for app lifecycle
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Initialize resources on startup
-    client = httpx.AsyncClient(timeout=httpx.Timeout(150), limits=httpx.Limits(max_keepalive_connections=5, max_connections=10))
-    app.state.http_client = client
-    
-    # Initialize session on startup
+    # Initialize resources at startup
+    logger.info("Application starting up")
     try:
-        await session_manager.refresh_if_needed(client)
+        # Initialize session on startup
+        await session_manager.initialize_async()
     except Exception as e:
         logger.error(f"Startup initialization error: {e}")
     
     yield
     
-    # Clean up resources on shutdown
-    await client.aclose()
-    gc.collect()  # Force garbage collection
+    # Clean up resources at shutdown
+    logger.info("Application shutting down")
+    # Force garbage collection to free memory
+    gc.collect()
 
-# Create FastAPI app with lifespan
+
+# Create FastAPI app with lifespan manager
 app = FastAPI(lifespan=lifespan)
 
-# Add CORS middleware with minimal overhead
+# Add CORS middleware
+from fastapi.middleware.cors import CORSMiddleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -57,61 +59,171 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Configuration class with minimal memory footprint
+# Memory optimization: Add middleware to clean up memory after each request
+class MemoryOptimizationMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        # Run garbage collection in a separate thread to avoid blocking
+        await run_in_threadpool(gc.collect)
+        return response
+
+app.add_middleware(MemoryOptimizationMiddleware)
+
+# Configuration management
 class Config:
     API_KEY = "TkoWuEN8cpDJubb7Zfwxln16NQDZIc8z"
     BASE_URL = "https://api-bj.wenxiaobai.com/api/v1.0"
     BOT_ID = 200006
     DEFAULT_MODEL = "DeepSeek-R1"
+    # Memory optimization: Add connection pool limits
+    MAX_CONNECTIONS = 10
+    MAX_KEEPALIVE_CONNECTIONS = 5
+    KEEPALIVE_EXPIRY = 30.0  # seconds
+    # Add retry configuration
+    MAX_RETRIES = 3
+    RETRY_BACKOFF_FACTOR = 0.5
 
-# Optimized session manager with minimal state
+
+# Session management with improved error handling and async support
 class SessionManager:
     def __init__(self):
         self.device_id = None
         self.token = None
         self.user_id = None
         self.conversation_id = None
-        self.last_refresh = 0
-        self.refresh_interval = 3600  # Refresh token every hour
+        self._lock = asyncio.Lock()
+        self._last_activity = time.time()
+        self._client = None
+        self._initialized = False
+        self._error_count = 0
+        self._max_errors = 5
+
+    async def get_client(self):
+        """Get or create an HTTP client with connection pooling"""
+        if self._client is None:
+            limits = httpx.Limits(
+                max_connections=Config.MAX_CONNECTIONS,
+                max_keepalive_connections=Config.MAX_KEEPALIVE_CONNECTIONS,
+                keepalive_expiry=Config.KEEPALIVE_EXPIRY
+            )
+            self._client = httpx.AsyncClient(
+                timeout=httpx.Timeout(150.0),
+                limits=limits
+            )
+        return self._client
+
+    async def initialize_async(self):
+        """Initialize session asynchronously"""
+        async with self._lock:
+            try:
+                self.device_id = await run_in_threadpool(generate_device_id)
+                self.token, self.user_id = await self._get_auth_token_async(self.device_id)
+                self.conversation_id = await self._create_conversation_async(self.device_id, self.token, self.user_id)
+                self._last_activity = time.time()
+                self._initialized = True
+                self._error_count = 0
+                logger.info(f"Session initialized: user_id={self.user_id}, conversation_id={self.conversation_id}")
+            except Exception as e:
+                self._error_count += 1
+                logger.error(f"Session initialization failed: {e}")
+                if self._error_count >= self._max_errors:
+                    logger.critical("Too many initialization errors, service may be unavailable")
+                raise
+
+    def initialize(self):
+        """Synchronous wrapper for initialize_async"""
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(self.initialize_async())
 
     def is_initialized(self):
         """Check if session is initialized"""
-        return all([self.device_id, self.token, self.user_id, self.conversation_id])
+        return self._initialized and all([self.device_id, self.token, self.user_id, self.conversation_id])
 
-    async def refresh_if_needed(self, client=None):
+    def is_expired(self, max_idle_time=3600):
+        """Check if session is expired based on idle time"""
+        return time.time() - self._last_activity > max_idle_time
+
+    async def refresh_if_needed(self):
         """Refresh session if needed"""
-        current_time = time.time()
-        
-        # Check if refresh is needed
-        if (not self.is_initialized() or 
-            current_time - self.last_refresh > self.refresh_interval):
-            await self.initialize(client)
-            self.last_refresh = current_time
+        if not self.is_initialized() or self.is_expired():
+            await self.initialize_async()
+        else:
+            self._last_activity = time.time()
 
-    async def initialize(self, client=None):
-        """Initialize session with minimal overhead"""
-        close_client = False
-        if client is None:
-            client = httpx.AsyncClient(timeout=httpx.Timeout(30))
-            close_client = True
-            
+    async def _get_auth_token_async(self, device_id: str) -> Tuple[str, str]:
+        """Get authentication token asynchronously"""
+        timestamp = generate_timestamp()
+        payload = {
+            'deviceId': device_id,
+            'device': 'Edge',
+            'client': 'tourist',
+            'phone': device_id,
+            'code': device_id,
+            'extraInfo': {'url': 'https://www.wenxiaobai.com/chat/tourist'},
+        }
+        data = json.dumps(payload, separators=(',', ':'))
+        digest = calculate_sha256(data)
+        headers = create_common_headers(timestamp, digest)
+        
+        client = await self.get_client()
         try:
-            self.device_id = generate_device_id()
-            self.token, self.user_id = await get_auth_token(self.device_id, client)
-            self.conversation_id = await create_conversation(self.device_id, self.token, self.user_id, client)
-            logger.info(f"Session initialized: user_id={self.user_id}, conversation_id={self.conversation_id}")
-        finally:
-            if close_client:
-                await client.aclose()
+            response = await client.post(
+                f"{Config.BASE_URL}/user/sessions",
+                headers=headers,
+                content=data,
+                timeout=300
+            )
+            response.raise_for_status()
+            result = response.json()
+            return result['data']['token'], result['data']['user']['id']
+        except httpx.RequestError as e:
+            logger.error(f"Auth token request failed: {e}")
+            raise HTTPException(status_code=500, detail=f"Authentication failed: {str(e)}")
+        except (KeyError, json.JSONDecodeError) as e:
+            logger.error(f"Auth response parsing failed: {e}")
+            raise HTTPException(status_code=500, detail="Server returned invalid authentication data")
+
+    async def _create_conversation_async(self, device_id: str, token: str, user_id: str) -> str:
+        """Create new conversation asynchronously"""
+        timestamp = generate_timestamp()
+        payload = {'visitorId': device_id}
+        data = json.dumps(payload, separators=(',', ':'))
+        digest = calculate_sha256(data)
+        headers = create_common_headers(timestamp, digest, token, device_id)
+        
+        client = await self.get_client()
+        try:
+            response = await client.post(
+                f"{Config.BASE_URL}/core/conversations/users/{user_id}/bots/{Config.BOT_ID}/conversation",
+                headers=headers,
+                content=data,
+                timeout=300
+            )
+            response.raise_for_status()
+            return response.json()['data']
+        except httpx.RequestError as e:
+            logger.error(f"Create conversation failed: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to create conversation: {str(e)}")
+        except (KeyError, json.JSONDecodeError) as e:
+            logger.error(f"Conversation response parsing failed: {e}")
+            raise HTTPException(status_code=500, detail="Server returned invalid conversation data")
+
+    async def close(self):
+        """Close the HTTP client"""
+        if self._client:
+            await self._client.aclose()
+            self._client = None
+
 
 # Create session manager instance
 session_manager = SessionManager()
 
-# Optimized Pydantic models with minimal validation overhead
+
 class Message(BaseModel):
     role: str
     content: str
     name: Optional[str] = None
+
 
 class ChatCompletionRequest(BaseModel):
     model: str
@@ -125,6 +237,7 @@ class ChatCompletionRequest(BaseModel):
     frequency_penalty: Optional[float] = 0
     user: Optional[str] = None
 
+
 class ModelData(BaseModel):
     id: str
     object: str = "model"
@@ -134,24 +247,27 @@ class ModelData(BaseModel):
     root: str
     parent: Optional[str] = None
 
-# Utility functions optimized for memory efficiency
+
 def generate_device_id() -> str:
-    """Generate device ID with minimal overhead"""
+    """Generate device ID"""
     return f"{uuid.uuid4().hex}_{int(time.time() * 1000)}_{random.randint(100000, 999999)}"
 
+
 def generate_timestamp() -> str:
-    """Generate UTC timestamp string with minimal overhead"""
+    """Generate UTC timestamp string"""
     timestamp_ms = int(time.time() * 1000) + 559
     utc_time = datetime.datetime.utcfromtimestamp(timestamp_ms / 1000.0)
     return utc_time.strftime('%a, %d %b %Y %H:%M:%S GMT')
 
+
 def calculate_sha256(data: str) -> str:
-    """Calculate SHA-256 digest with minimal overhead"""
+    """Calculate SHA-256 digest"""
     sha256 = hashlib.sha256(data.encode()).digest()
     return base64.b64encode(sha256).decode()
 
+
 def generate_signature(timestamp: str, digest: str) -> str:
-    """Generate request signature with minimal overhead"""
+    """Generate request signature"""
     message = f"x-date: {timestamp}\ndigest: SHA-256={digest}"
     signature = hmac.new(
         Config.API_KEY.encode(),
@@ -160,9 +276,10 @@ def generate_signature(timestamp: str, digest: str) -> str:
     ).digest()
     return base64.b64encode(signature).decode()
 
+
 def create_common_headers(timestamp: str, digest: str, token: Optional[str] = None,
                           device_id: Optional[str] = None) -> dict:
-    """Create common request headers with minimal overhead"""
+    """Create common request headers"""
     headers = {
         'accept': 'application/json, text/plain, */*',
         'accept-language': 'zh-CN,zh;q=0.9',
@@ -170,10 +287,14 @@ def create_common_headers(timestamp: str, digest: str, token: Optional[str] = No
         'content-type': 'application/json',
         'digest': f'SHA-256={digest}',
         'origin': 'https://www.wenxiaobai.com',
+        'priority': 'u=1, i',
         'referer': 'https://www.wenxiaobai.com/',
         'sec-ch-ua': '"Chromium";v="134", "Not:A-Brand";v="24", "Microsoft Edge";v="134"',
         'sec-ch-ua-mobile': '?0',
         'sec-ch-ua-platform': '"Windows"',
+        'sec-fetch-dest': 'empty',
+        'sec-fetch-mode': 'cors',
+        'sec-fetch-site': 'same-site',
         'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36 Edg/134.0.0.0',
         'x-date': timestamp,
         'x-yuanshi-appname': 'wenxiaobai',
@@ -195,84 +316,47 @@ def create_common_headers(timestamp: str, digest: str, token: Optional[str] = No
 
     return headers
 
-async def get_auth_token(device_id: str, client) -> Tuple[str, str]:
-    """Get authentication token with minimal overhead"""
-    timestamp = generate_timestamp()
-    payload = {
-        'deviceId': device_id,
-        'device': 'Edge',
-        'client': 'tourist',
-        'phone': device_id,
-        'code': device_id,
-        'extraInfo': {'url': 'https://www.wenxiaobai.com/chat/tourist'},
-    }
-    data = json.dumps(payload, separators=(',', ':'))
-    digest = calculate_sha256(data)
 
-    headers = create_common_headers(timestamp, digest)
-
-    try:
-        response = await client.post(
-            f"{Config.BASE_URL}/user/sessions",
-            headers=headers,
-            content=data
-        )
-        response.raise_for_status()
-        result = response.json()
-        return result['data']['token'], result['data']['user']['id']
-    except httpx.RequestError as e:
-        logger.error(f"Failed to get auth token: {e}")
-        raise HTTPException(status_code=500, detail=f"Authentication failed: {str(e)}")
-    except (KeyError, json.JSONDecodeError) as e:
-        logger.error(f"Failed to parse auth response: {e}")
-        raise HTTPException(status_code=500, detail="Server returned invalid authentication data")
-
-async def create_conversation(device_id: str, token: str, user_id: str, client) -> str:
-    """Create new conversation with minimal overhead"""
-    timestamp = generate_timestamp()
-    payload = {'visitorId': device_id}
-    data = json.dumps(payload, separators=(',', ':'))
-    digest = calculate_sha256(data)
-
-    headers = create_common_headers(timestamp, digest, token, device_id)
-
-    try:
-        response = await client.post(
-            f"{Config.BASE_URL}/core/conversations/users/{user_id}/bots/{Config.BOT_ID}/conversation",
-            headers=headers,
-            content=data
-        )
-        response.raise_for_status()
-        return response.json()['data']
-    except httpx.RequestError as e:
-        logger.error(f"Failed to create conversation: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to create conversation: {str(e)}")
-    except (KeyError, json.JSONDecodeError) as e:
-        logger.error(f"Failed to parse conversation response: {e}")
-        raise HTTPException(status_code=500, detail="Server returned invalid conversation data")
-
-# Optimized content processing functions
 def is_thinking_content(content: str) -> bool:
     """Check if content is thinking process"""
-    return "\`\`\`ys_think" in content
+    return "```ys_think" in content
+
 
 def clean_thinking_content(content: str) -> str:
-    """Clean thinking process content, remove special markers"""
-    # Remove entire thinking block
-    if "\`\`\`ys_think" in content:
-        # Use regex to remove entire thinking block
-        cleaned = re.sub(r'\`\`\`ys_think.*?\`\`\`', '', content, flags=re.DOTALL)
-        # If only whitespace remains after cleaning, return empty string
+    """Clean thinking content, remove special markers"""
+    # Remove thinking blocks
+    if "```ys_think" in content:
+        cleaned = re.sub(r'```ys_think.*?```', '', content, flags=re.DOTALL)
         if cleaned and cleaned.strip():
             return cleaned.strip()
         return ""
     return content
 
-# Optimized response chunk creation
+
+# New function to clean reference artifacts
+def clean_reference_artifacts(content: str) -> str:
+    """Remove reference artifacts like [这是一个数字](@ref) from content"""
+    # Pattern to match references like [text](@ref)
+    pattern = r'\[[^\]]+\]$$@ref$$'
+    cleaned = re.sub(pattern, '', content)
+    return cleaned
+
+
+# Verify API key
+async def verify_api_key(authorization: str = Header(None)):
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Missing API key")
+
+    api_key = authorization.replace("Bearer ", "").strip()
+    if api_key != Config.API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    return api_key
+
+
 def create_chunk(sse_id: str, created: int, content: Optional[str] = None,
                  is_first: bool = False, meta: Optional[dict] = None,
                  finish_reason: Optional[str] = None) -> dict:
-    """Create response chunk with minimal overhead"""
+    """Create response chunk"""
     delta = {}
 
     if content is not None:
@@ -296,45 +380,49 @@ def create_chunk(sse_id: str, created: int, content: Optional[str] = None,
         }]
     }
 
+
 async def process_message_event(data: dict, is_first_chunk: bool, in_thinking_block: bool,
                                 thinking_started: bool, thinking_content: list) -> Tuple[str, bool, bool, bool, list]:
-    """处理消息事件"""
+    """Process message event"""
     content = data.get("content", "")
     timestamp = data.get("timestamp", "")
     created = int(timestamp) // 1000 if timestamp else int(time.time())
     sse_id = data.get('sseId', str(uuid.uuid4()))
     result = ""
 
-    # 检查是否是思考块的开始
+    # Clean reference artifacts
+    content = clean_reference_artifacts(content)
+
+    # Check if it's the start of a thinking block
     if "```ys_think" in content and not thinking_started:
         thinking_started = True
         in_thinking_block = True
-        # 发送思考块开始标记
+        # Send thinking block start marker
         chunk = create_chunk(
             sse_id=sse_id,
             created=created,
-            content="<think>\n\n",
+            content="<Thinking>\n\n",
             is_first=is_first_chunk
         )
-        result = f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+        result = f"data: \{json.dumps(chunk, ensure_ascii=False)\}\n\n"
         return result, in_thinking_block, thinking_started, is_first_chunk, thinking_content
 
-    # 检查是否是思考块的结束
+    # Check if it's the end of a thinking block
     if "```" in content and in_thinking_block:
         in_thinking_block = False
-        # 发送思考块结束标记
+        # Send thinking block end marker
         chunk = create_chunk(
             sse_id=sse_id,
             created=created,
-            content="\n</think>\n\n"
+            content="\n</Thinking>\n\n"
         )
         result = f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
         return result, in_thinking_block, thinking_started, is_first_chunk, thinking_content
 
-    # 如果在思考块内，收集思考内容
+    # If in thinking block, collect thinking content
     if in_thinking_block:
         thinking_content.append(content)
-        # 在思考块内也发送内容，但标记为思考内容
+        # Also send content in thinking block, but mark as thinking content
         chunk = create_chunk(
             sse_id=sse_id,
             created=created,
@@ -343,12 +431,12 @@ async def process_message_event(data: dict, is_first_chunk: bool, in_thinking_bl
         result = f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
         return result, in_thinking_block, thinking_started, is_first_chunk, thinking_content
 
-    # 清理内容，移除思考块
+    # Clean content, remove thinking blocks
     content = clean_thinking_content(content)
-    if not content:  # 如果清理后内容为空，跳过
+    if not content:  # Skip if content is empty after cleaning
         return result, in_thinking_block, thinking_started, is_first_chunk, thinking_content
 
-    # 正常发送内容
+    # Send normal content
     chunk = create_chunk(
         sse_id=sse_id,
         created=created,
@@ -360,18 +448,19 @@ async def process_message_event(data: dict, is_first_chunk: bool, in_thinking_bl
 
 
 def process_generate_end_event(data: dict, in_thinking_block: bool, thinking_content: list) -> List[str]:
-    """Process generation end event with minimal overhead"""
+    """Process generation end event"""
     result = []
     timestamp = data.get("timestamp", "")
     created = int(timestamp) // 1000 if timestamp else int(time.time())
     sse_id = data.get('sseId', str(uuid.uuid4()))
 
-    # If thinking block hasn't ended yet, send end marker
+    # If thinking block hasn't ended, send end marker
     if in_thinking_block:
         end_thinking_chunk = create_chunk(
             sse_id=sse_id,
             created=created,
-            content="\n<Thinking>\n</Thinking>\n\n"
+            content="\n<Thinking>
+</Thinking>\n\n"
         )
         result.append(f"data: {json.dumps(end_thinking_chunk, ensure_ascii=False)}\n\n")
 
@@ -393,78 +482,100 @@ def process_generate_end_event(data: dict, in_thinking_block: bool, thinking_con
     result.append("data: [DONE]\n\n")
     return result
 
-# Optimized API key verification
-async def verify_api_key(authorization: str = Header(None)):
-    """Verify API key with minimal overhead"""
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Missing API key")
 
-    api_key = authorization.replace("Bearer ", "").strip()
-    if api_key != Config.API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API key")
-    return api_key
+# Improved error handling with retries
+async def with_retries(func, *args, **kwargs):
+    """Execute a function with retries"""
+    retries = 0
+    last_error = None
+    
+    while retries <= Config.MAX_RETRIES:
+        try:
+            return await func(*args, **kwargs)
+        except (httpx.RequestError, HTTPException) as e:
+            last_error = e
+            retries += 1
+            if retries > Config.MAX_RETRIES:
+                break
+            
+            # Exponential backoff
+            wait_time = Config.RETRY_BACKOFF_FACTOR * (2 ** (retries - 1))
+            logger.warning(f"Retry {retries}/{Config.MAX_RETRIES} after error: {e}. Waiting {wait_time}s")
+            await asyncio.sleep(wait_time)
+    
+    # If we get here, all retries failed
+    logger.error(f"All retries failed: {last_error}")
+    if isinstance(last_error, HTTPException):
+        raise last_error
+    raise HTTPException(status_code=500, detail=f"Request failed after {Config.MAX_RETRIES} retries: {str(last_error)}")
 
-# Optimized response generation
+
 async def generate_response(messages: List[dict], model: str, temperature: float, stream: bool,
                             max_tokens: Optional[int] = None, presence_penalty: float = 0,
-                            frequency_penalty: float = 0, top_p: float = 1.0, 
-                            client=None) -> AsyncGenerator[str, None]:
-    """Generate response with true streaming and minimal memory usage"""
+                            frequency_penalty: float = 0, top_p: float = 1.0) -> AsyncGenerator[str, None]:
+    """Generate response with true streaming and improved error handling"""
     # Ensure session is initialized
-    close_client = False
-    if client is None:
-        client = httpx.AsyncClient(timeout=httpx.Timeout(150))
-        close_client = True
-    
-    try:
-        await session_manager.refresh_if_needed(client)
+    await session_manager.refresh_if_needed()
 
-        timestamp = generate_timestamp()
-        payload = {
-            'userId': session_manager.user_id,
-            'botId': Config.BOT_ID,
-            'botAlias': 'custom',
-            'query': messages[-1]['content'],
-            'isRetry': False,
-            'breakingStrategy': 0,
-            'isNewConversation': True,
-            'mediaInfos': [],
-            'turnIndex': 0,
-            'rewriteQuery': '',
-            'conversationId': session_manager.conversation_id,
-            'capabilities': [
-                {
-                    'capability': 'otherBot',
-                    'capabilityRang': 0,
-                    'defaultQuery': '',
-                    'icon': 'https://wy-static.wenxiaobai.com/bot-capability/prod/%E6%B7%B1%E5%BA%A6%E6%80%9D%E8%80%83.png',
-                    'minAppVersion': '',
-                    'title': '深度思考(R1)',
-                    'botId': 210029,
-                    'botDesc': '深度回答这个问题（DeepSeek R1）',
-                    'selectedIcon': 'https://wy-static.wenxiaobai.com/bot-capability/prod/%E6%B7%B1%E5%BA%A6%E6%80%9D%E8%80%83%E9%80%89%E4%B8%AD.png',
-                    'botIcon': 'https://platform-dev-1319140468.cos.ap-nanjing.myqcloud.com/bot/avatar/2025/02/06/612cbff8-51e6-4c6a-8530-cb551bcfda56.webp',
-                    'defaultHidden': False,
-                    'defaultSelected': False,
-                    'key': 'deep_think',
-                    'promptMenu': False,
-                    'isPromptMenu': False,
-                    'defaultPlaceholder': '',
-                    '_id': 'deep_think',
-                },
-            ],
-            'attachmentInfo': {
-                'url': {
-                    'infoList': [],
-                },
+    timestamp = generate_timestamp()
+    
+    # Extract context from previous messages
+    context = []
+    for msg in messages[:-1]:  # All messages except the last one
+        if msg['role'] in ['user', 'assistant']:
+            context.append({
+                'role': 'user' if msg['role'] == 'user' else 'bot',
+                'content': msg['content']
+            })
+    
+    # Prepare payload with context
+    payload = {
+        'userId': session_manager.user_id,
+        'botId': Config.BOT_ID,
+        'botAlias': 'custom',
+        'query': messages[-1]['content'],
+        'isRetry': False,
+        'breakingStrategy': 0,
+        'isNewConversation': len(context) == 0,  # Only new if no context
+        'mediaInfos': [],
+        'turnIndex': len(context) // 2,  # Each turn has user + assistant
+        'rewriteQuery': '',
+        'conversationId': session_manager.conversation_id,
+        'capabilities': [
+            {
+                'capability': 'otherBot',
+                'capabilityRang': 0,
+                'defaultQuery': '',
+                'icon': 'https://wy-static.wenxiaobai.com/bot-capability/prod/%E6%B7%B1%E5%BA%A6%E6%80%9D%E8%80%83.png',
+                'minAppVersion': '',
+                'title': '深度思考(R1)',
+                'botId': 210029,
+                'botDesc': '深度回答这个问题（DeepSeek R1）',
+                'selectedIcon': 'https://wy-static.wenxiaobai.com/bot-capability/prod/%E6%B7%B1%E5%BA%A6%E6%80%9D%E8%80%83%E9%80%89%E4%B8%AD.png',
+                'botIcon': 'https://platform-dev-1319140468.cos.ap-nanjing.myqcloud.com/bot/avatar/2025/02/06/612cbff8-51e6-4c6a-8530-cb551bcfda56.webp',
+                'defaultHidden': False,
+                'defaultSelected': False,
+                'key': 'deep_think',
+                'promptMenu': False,
+                'isPromptMenu': False,
+                'defaultPlaceholder': '',
+                '_id': 'deep_think',
             },
-            'inputWay': 'proactive',
-            'pureQuery': '',
-        }
-        data = json.dumps(payload, separators=(',', ':'))
+        ],
+        'attachmentInfo': {
+            'url': {
+                'infoList': [],
+            },
+        },
+        'inputWay': 'proactive',
+        'pureQuery': '',
+        'context': context  # Add context from previous messages
+    }
+    
+    data = json.dumps(payload, separators=(',', ':'))
     digest = calculate_sha256(data)
 
-    # 创建流式请求的特殊头部
+    # Create special headers for streaming request
     headers = create_common_headers(timestamp, digest, session_manager.token, session_manager.device_id)
     headers.update({
         'accept': 'text/event-stream, text/event-stream',
@@ -472,64 +583,118 @@ async def generate_response(messages: List[dict], model: str, temperature: float
         'x-yuanshi-appversionname': '3.1.0',
     })
 
+    # Get client from session manager
+    client = await session_manager.get_client()
+    
+    # Process streaming response with improved error handling
     try:
-        # 使用 stream=True 参数，实现真正的流式处理
-        async with httpx.AsyncClient(timeout=httpx.Timeout(900)) as client:
-            async with client.stream('POST', f"{Config.BASE_URL}/core/conversation/chat/v1",
-                                     headers=headers, content=data) as response:
-                response.raise_for_status()
+        async with client.stream('POST', f"{Config.BASE_URL}/core/conversation/chat/v1",
+                                headers=headers, content=data) as response:
+            response.raise_for_status()
 
-                # 处理流式响应
-                is_first_chunk = True
-                current_event = None
-                in_thinking_block = False
-                thinking_content = []
-                thinking_started = False
+            # Process streaming response
+            is_first_chunk = True
+            current_event = None
+            in_thinking_block = False
+            thinking_content = []
+            thinking_started = False
+            empty_response_count = 0
+            max_empty_responses = 5
+            last_activity = time.time()
+            timeout = 60  # seconds
 
-                async for line in response.aiter_lines():
-                    line = line.strip()
-                    if not line:
-                        current_event = None
+            async for line in response.aiter_lines():
+                # Reset timeout counter on activity
+                last_activity = time.time()
+                
+                line = line.strip()
+                if not line:
+                    current_event = None
+                    empty_response_count += 1
+                    
+                    # If too many empty responses, yield a heartbeat to keep connection alive
+                    if empty_response_count >= max_empty_responses:
+                        empty_response_count = 0
+                        yield f"data: {json.dumps({'heartbeat': True})}\n\n"
+                    
+                    continue
+
+                # Reset empty response counter on valid data
+                empty_response_count = 0
+
+                # Parse event type
+                if line.startswith("event:"):
+                    current_event = line[len("event:"):].strip()
+                    continue
+
+                # Process data line
+                elif line.startswith("data:"):
+                    json_str = line[len("data:"):].strip()
+                    try:
+                        data = json.loads(json_str)
+
+                        # Process message event
+                        if current_event == "message":
+                            result, in_thinking_block, thinking_started, is_first_chunk, thinking_content = await process_message_event(
+                                data, is_first_chunk, in_thinking_block, thinking_started, thinking_content
+                            )
+                            if result:
+                                yield result
+
+                        # Process generation end event
+                        elif current_event == "generateEnd":
+                            for chunk in process_generate_end_event(data, in_thinking_block, thinking_content):
+                                yield chunk
+
+                    except json.JSONDecodeError as e:
+                        logger.error(f"JSON parsing error: {e}")
                         continue
+                
+                # Check for timeout
+                if time.time() - last_activity > timeout:
+                    logger.warning("Response stream timed out")
+                    # Send end marker on timeout
+                    for chunk in process_generate_end_event(
+                        {"timestamp": str(int(time.time() * 1000))}, 
+                        in_thinking_block, 
+                        thinking_content
+                    ):
+                        yield chunk
+                    break
 
-                    # 解析事件类型
-                    if line.startswith("event:"):
-                        current_event = line[len("event:"):].strip()
-                        continue
-
-                    # 处理数据行
-                    elif line.startswith("data:"):
-                        json_str = line[len("data:"):].strip()
-                        try:
-                            data = json.loads(json_str)
-
-                            # 处理消息事件
-                            if current_event == "message":
-                                result, in_thinking_block, thinking_started, is_first_chunk, thinking_content = await process_message_event(
-                                    data, is_first_chunk, in_thinking_block, thinking_started, thinking_content
-                                )
-                                if result:
-                                    yield result
-                        except json.JSONDecodeError as e:
-                            logger.error(f"JSON parsing error: {e}")
-                            continue
     except httpx.RequestError as e:
         logger.error(f"Generate response error: {e}")
         # Try to reinitialize session
         try:
-            await session_manager.initialize(client)
+            await session_manager.initialize_async()
             logger.info("Session reinitialized")
         except Exception as re_init_error:
-            logger.error(f"Failed to reinitialize session: {re_init_error}")
-        raise HTTPException(status_code=500, detail=f"Request error: {str(e)}")
-    finally:
-        if close_client:
-            await client.aclose()
+            logger.error(f"Session reinitialization failed: {re_init_error}")
+        
+        # Send error response in streaming format
+        error_id = str(uuid.uuid4())
+        error_time = int(time.time())
+        error_chunk = create_chunk(
+            sse_id=error_id,
+            created=error_time,
+            content="I apologize, but I encountered an error processing your request. Please try again.",
+            is_first=True
+        )
+        yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n"
+        
+        end_chunk = create_chunk(
+            sse_id=error_id,
+            created=error_time,
+            finish_reason="error"
+        )
+        yield f"data: {json.dumps(end_chunk, ensure_ascii=False)}\n\n"
+        yield "data: [DONE]\n\n"
 
-# API endpoints
+
 @app.get("/")
-async def health():
+async def hff():
     return {"status": "ok", "message": "hefengfan API successfully deployed!"}
+
 
 @app.get("/v1/models")
 async def list_models():
@@ -560,21 +725,19 @@ async def list_models():
 
     return {"object": "list", "data": models_data}
 
+
 @app.post("/v1/chat/completions")
-async def chat_completions(request: ChatCompletionRequest, authorization: str = Header(None), req: Request = None):
-    """Process chat completion requests with memory optimization"""
+async def chat_completions(request: ChatCompletionRequest, authorization: str = Header(None), background_tasks: BackgroundTasks):
+    """Handle chat completion requests with improved memory management"""
     # Verify API key
     await verify_api_key(authorization)
 
-    # Add request log
-    logger.info(f"Received chat request: model={request.model}, stream={request.stream}")
+    # Log request (minimal logging to save memory)
+    logger.info(f"Chat request: model={request.model}, stream={request.stream}")
     messages = [msg.model_dump() for msg in request.messages]
 
-    # Get client from app state
-    client = req.app.state.http_client if hasattr(req.app.state, 'http_client') else None
-
     if not request.stream:
-        # Non-streaming response processing
+        # Non-streaming response handling
         content = ""
         thinking_content = ""
         meta = None
@@ -588,8 +751,7 @@ async def chat_completions(request: ChatCompletionRequest, authorization: str = 
                 max_tokens=request.max_tokens,
                 presence_penalty=request.presence_penalty,
                 frequency_penalty=request.frequency_penalty,
-                top_p=request.top_p,
-                client=client
+                top_p=request.top_p
         ):
             try:
                 if chunk_str.startswith("data: ") and not chunk_str.startswith("data: [DONE]"):
@@ -599,7 +761,7 @@ async def chat_completions(request: ChatCompletionRequest, authorization: str = 
                         if "content" in delta:
                             content_part = delta["content"]
 
-                            # Process thinking block markers
+                            # Handle thinking block markers
                             if content_part == "<Thinking>\n\n":
                                 in_thinking = True
                                 continue
@@ -617,10 +779,13 @@ async def chat_completions(request: ChatCompletionRequest, authorization: str = 
                         if "meta" in delta:
                             meta = delta["meta"]
             except Exception as e:
-                logger.error(f"Error processing non-streaming response: {e}")
+                logger.error(f"Non-streaming response processing error: {e}")
+
+        # Clean reference artifacts in final content
+        content = clean_reference_artifacts(content)
 
         # Build complete response
-        return {
+        response = {
             "id": str(uuid.uuid4()),
             "object": "chat.completion",
             "created": int(time.time()),
@@ -628,13 +793,18 @@ async def chat_completions(request: ChatCompletionRequest, authorization: str = 
             "choices": [{
                 "message": {
                     "role": "assistant",
-                    "reasoning_content": f"<Thinking>\n{thinking_content}\n</Thinking>" if thinking_content else None,
+                    "reasoning_content": f"<Thinking>\n\{thinking_content\}\n</Thinking>" if thinking_content else None,
                     "content": content,
                     "meta": meta
                 },
                 "finish_reason": "stop"
             }]
         }
+        
+        # Schedule garbage collection after request
+        background_tasks.add_task(gc.collect)
+        
+        return response
 
     # Streaming response
     return StreamingResponse(
@@ -646,16 +816,28 @@ async def chat_completions(request: ChatCompletionRequest, authorization: str = 
             max_tokens=request.max_tokens,
             presence_penalty=request.presence_penalty,
             frequency_penalty=request.frequency_penalty,
-            top_p=request.top_p,
-            client=client
+            top_p=request.top_p
         ),
         media_type="text/event-stream"
     )
 
+
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
-    if session_manager.is_initialized():
-        return {"status": "ok", "session": "active"}
-    else:
-        return {"status": "degraded", "session": "inactive"}
+    """Health check endpoint with memory usage info"""
+    import psutil
+    
+    process = psutil.Process()
+    memory_info = process.memory_info()
+    memory_mb = memory_info.rss / (1024 * 1024)
+    
+    status = "ok" if session_manager.is_initialized() else "degraded"
+    session_status = "active" if session_manager.is_initialized() else "inactive"
+    
+    return {
+        "status": status, 
+        "session": session_status,
+        "memory_usage_mb": round(memory_mb, 2),
+        "uptime_seconds": int(time.time() - process.create_time())
+    }
+
