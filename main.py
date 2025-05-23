@@ -5,9 +5,6 @@ import uuid
 import datetime
 import time
 import re
-import gc
-import os
-import signal
 from fastapi import FastAPI, HTTPException, Header, Request, BackgroundTasks
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -19,7 +16,9 @@ import base64
 import hmac
 from starlette.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
-from fastapi.concurrency import run_in_threadpool
+import gc
+import psutil
+import threading
 
 # Configure logging with minimal overhead
 logging.basicConfig(
@@ -29,18 +28,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Memory management settings
-MAX_MEMORY_PERCENT = 80  # Trigger cleanup when memory usage exceeds this percentage
-MEMORY_CHECK_INTERVAL = 300  # Check memory every 5 minutes
-last_memory_check = 0
-last_gc_run = 0
-
-# Request tracking for health monitoring
-active_requests = 0
-total_requests = 0
-failed_requests = 0
-empty_responses = 0
-last_error_time = 0
+# Memory cleanup settings
+MEMORY_CLEANUP_THRESHOLD = 80  # Percentage of memory usage to trigger cleanup
+MEMORY_CLEANUP_INTERVAL = 300  # Seconds between memory cleanup checks
+last_request_time = time.time()
+cleanup_lock = threading.Lock()
 
 # Use lifespan for more efficient resource management
 @asynccontextmanager
@@ -48,31 +40,32 @@ async def lifespan(app: FastAPI):
     # Initialize resources on startup
     client = httpx.AsyncClient(
         timeout=httpx.Timeout(150), 
-        limits=httpx.Limits(max_keepalive_connections=20, max_connections=100),
-        http2=True  # Enable HTTP/2 for better connection reuse
+        limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
+        http2=True  # Enable HTTP/2 for better performance
     )
     app.state.http_client = client
+    app.state.last_activity = time.time()
     
     # Initialize session on startup
     try:
         await session_manager.refresh_if_needed(client)
-        logger.info("Initial session established successfully")
     except Exception as e:
         logger.error(f"Startup initialization error: {e}")
     
-    # Set up signal handlers for graceful shutdown
-    def handle_sigterm(signum, frame):
-        logger.info("Received SIGTERM, shutting down gracefully")
-    
-    signal.signal(signal.SIGTERM, handle_sigterm)
+    # Start background memory cleanup task
+    cleanup_task = asyncio.create_task(periodic_memory_cleanup(app))
     
     yield
     
     # Clean up resources on shutdown
+    cleanup_task.cancel()
+    try:
+        await cleanup_task
+    except asyncio.CancelledError:
+        pass
+    
     await client.aclose()
-    logger.info("HTTP client closed")
-    await run_in_threadpool(gc.collect)
-    logger.info("Final garbage collection completed")
+    gc.collect()  # Force garbage collection
 
 # Create FastAPI app with lifespan
 app = FastAPI(lifespan=lifespan)
@@ -92,9 +85,9 @@ class Config:
     BASE_URL = "https://api-bj.wenxiaobai.com/api/v1.0"
     BOT_ID = 200006
     DEFAULT_MODEL = "DeepSeek-R1"
-    MAX_RETRIES = 3
-    RETRY_DELAY = 1.0  # seconds
-    CONTEXT_WINDOW_SIZE = 8192  # Maximum context size
+    # Context handling settings
+    MAX_CONTEXT_MESSAGES = 10  # Maximum number of messages to include in context
+    CONTEXT_TOKEN_LIMIT = 4000  # Approximate token limit for context
 
 # Optimized session manager with minimal state
 class SessionManager:
@@ -104,11 +97,7 @@ class SessionManager:
         self.user_id = None
         self.conversation_id = None
         self.last_refresh = 0
-        self.refresh_interval = 1800  # Refresh token every 30 minutes
-        self.error_count = 0
-        self.max_errors = 5
-        self.last_error_time = 0
-        self.error_cooldown = 60  # Wait 60 seconds after multiple errors
+        self.refresh_interval = 3600  # Refresh token every hour
 
     def is_initialized(self):
         """Check if session is initialized"""
@@ -118,17 +107,11 @@ class SessionManager:
         """Refresh session if needed"""
         current_time = time.time()
         
-        # Check if we're in error cooldown
-        if self.error_count >= self.max_errors and current_time - self.last_error_time < self.error_cooldown:
-            logger.warning("In error cooldown, delaying refresh")
-            return
-        
         # Check if refresh is needed
         if (not self.is_initialized() or 
             current_time - self.last_refresh > self.refresh_interval):
             await self.initialize(client)
             self.last_refresh = current_time
-            self.error_count = 0  # Reset error count after successful refresh
 
     async def initialize(self, client=None):
         """Initialize session with minimal overhead"""
@@ -142,11 +125,6 @@ class SessionManager:
             self.token, self.user_id = await get_auth_token(self.device_id, client)
             self.conversation_id = await create_conversation(self.device_id, self.token, self.user_id, client)
             logger.info(f"Session initialized: user_id={self.user_id}, conversation_id={self.conversation_id}")
-        except Exception as e:
-            self.error_count += 1
-            self.last_error_time = time.time()
-            logger.error(f"Session initialization error: {e}, error count: {self.error_count}")
-            raise
         finally:
             if close_client:
                 await client.aclose()
@@ -182,58 +160,46 @@ class ModelData(BaseModel):
     parent: Optional[str] = None
 
 # Memory management functions
-async def check_memory_usage(background_tasks: BackgroundTasks):
-    """Check memory usage and trigger cleanup if needed"""
-    global last_memory_check, last_gc_run
-    
-    current_time = time.time()
-    if current_time - last_memory_check < MEMORY_CHECK_INTERVAL:
-        return
-    
-    last_memory_check = current_time
-    
-    try:
-        # Get memory info - this works on Linux systems
-        with open('/proc/self/status') as f:
-            for line in f:
-                if 'VmRSS:' in line:
-                    mem_usage = int(line.split()[1])
-                    break
-        
-        # Get total system memory
-        with open('/proc/meminfo') as f:
-            for line in f:
-                if 'MemTotal:' in line:
-                    total_mem = int(line.split()[1])
-                    break
-        
-        mem_percent = (mem_usage / total_mem) * 100
-        logger.info(f"Current memory usage: {mem_usage}KB / {total_mem}KB ({mem_percent:.1f}%)")
-        
-        if mem_percent > MAX_MEMORY_PERCENT and current_time - last_gc_run > 60:
-            logger.warning(f"Memory usage high ({mem_percent:.1f}%), triggering cleanup")
-            background_tasks.add_task(cleanup_memory)
-    except Exception as e:
-        logger.error(f"Error checking memory: {e}")
+async def periodic_memory_cleanup(app):
+    """Periodically check and clean up memory if needed"""
+    while True:
+        try:
+            await asyncio.sleep(MEMORY_CLEANUP_INTERVAL)
+            
+            # Check if the server has been idle
+            current_time = time.time()
+            if current_time - app.state.last_activity > MEMORY_CLEANUP_INTERVAL:
+                await cleanup_memory()
+        except Exception as e:
+            logger.error(f"Error in memory cleanup task: {e}")
 
 async def cleanup_memory():
-    """Clean up memory by forcing garbage collection"""
-    global last_gc_run
-    
-    logger.info("Running memory cleanup")
-    last_gc_run = time.time()
-    
-    # Run garbage collection
-    gc.collect()
-    
-    # Try to release memory back to the OS (Linux-specific)
+    """Clean up memory when usage is high or server is idle"""
     try:
-        import ctypes
-        libc = ctypes.CDLL('libc.so.6')
-        libc.malloc_trim(0)
-        logger.info("Released memory back to OS")
+        # Get current memory usage
+        memory_info = psutil.virtual_memory()
+        memory_percent = memory_info.percent
+        
+        if memory_percent > MEMORY_CLEANUP_THRESHOLD:
+            logger.info(f"Memory usage high ({memory_percent}%), performing cleanup")
+            
+            # Force garbage collection
+            gc.collect()
+            
+            # Additional memory optimization
+            import ctypes
+            libc = ctypes.CDLL("libc.so.6")
+            libc.malloc_trim(0)
+            
+            # Log memory after cleanup
+            memory_info = psutil.virtual_memory()
+            logger.info(f"Memory usage after cleanup: {memory_info.percent}%")
     except Exception as e:
-        logger.error(f"Error releasing memory to OS: {e}")
+        logger.error(f"Error during memory cleanup: {e}")
+
+def update_last_activity(app):
+    """Update the last activity timestamp"""
+    app.state.last_activity = time.time()
 
 # Utility functions optimized for memory efficiency
 def generate_device_id() -> str:
@@ -312,26 +278,21 @@ async def get_auth_token(device_id: str, client) -> Tuple[str, str]:
 
     headers = create_common_headers(timestamp, digest)
 
-    for attempt in range(Config.MAX_RETRIES):
-        try:
-            response = await client.post(
-                f"{Config.BASE_URL}/user/sessions",
-                headers=headers,
-                content=data
-            )
-            response.raise_for_status()
-            result = response.json()
-            return result['data']['token'], result['data']['user']['id']
-        except httpx.RequestError as e:
-            if attempt < Config.MAX_RETRIES - 1:
-                logger.warning(f"Auth token request failed (attempt {attempt+1}/{Config.MAX_RETRIES}): {e}")
-                await asyncio.sleep(Config.RETRY_DELAY * (attempt + 1))
-            else:
-                logger.error(f"Failed to get auth token after {Config.MAX_RETRIES} attempts: {e}")
-                raise HTTPException(status_code=500, detail=f"Authentication failed: {str(e)}")
-        except (KeyError, json.JSONDecodeError) as e:
-            logger.error(f"Failed to parse auth response: {e}")
-            raise HTTPException(status_code=500, detail="Server returned invalid authentication data")
+    try:
+        response = await client.post(
+            f"{Config.BASE_URL}/user/sessions",
+            headers=headers,
+            content=data
+        )
+        response.raise_for_status()
+        result = response.json()
+        return result['data']['token'], result['data']['user']['id']
+    except httpx.RequestError as e:
+        logger.error(f"Failed to get auth token: {e}")
+        raise HTTPException(status_code=500, detail=f"Authentication failed: {str(e)}")
+    except (KeyError, json.JSONDecodeError) as e:
+        logger.error(f"Failed to parse auth response: {e}")
+        raise HTTPException(status_code=500, detail="Server returned invalid authentication data")
 
 async def create_conversation(device_id: str, token: str, user_id: str, client) -> str:
     """Create new conversation with minimal overhead"""
@@ -342,25 +303,20 @@ async def create_conversation(device_id: str, token: str, user_id: str, client) 
 
     headers = create_common_headers(timestamp, digest, token, device_id)
 
-    for attempt in range(Config.MAX_RETRIES):
-        try:
-            response = await client.post(
-                f"{Config.BASE_URL}/core/conversations/users/{user_id}/bots/{Config.BOT_ID}/conversation",
-                headers=headers,
-                content=data
-            )
-            response.raise_for_status()
-            return response.json()['data']
-        except httpx.RequestError as e:
-            if attempt < Config.MAX_RETRIES - 1:
-                logger.warning(f"Create conversation request failed (attempt {attempt+1}/{Config.MAX_RETRIES}): {e}")
-                await asyncio.sleep(Config.RETRY_DELAY * (attempt + 1))
-            else:
-                logger.error(f"Failed to create conversation after {Config.MAX_RETRIES} attempts: {e}")
-                raise HTTPException(status_code=500, detail=f"Failed to create conversation: {str(e)}")
-        except (KeyError, json.JSONDecodeError) as e:
-            logger.error(f"Failed to parse conversation response: {e}")
-            raise HTTPException(status_code=500, detail="Server returned invalid conversation data")
+    try:
+        response = await client.post(
+            f"{Config.BASE_URL}/core/conversations/users/{user_id}/bots/{Config.BOT_ID}/conversation",
+            headers=headers,
+            content=data
+        )
+        response.raise_for_status()
+        return response.json()['data']
+    except httpx.RequestError as e:
+        logger.error(f"Failed to create conversation: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to create conversation: {str(e)}")
+    except (KeyError, json.JSONDecodeError) as e:
+        logger.error(f"Failed to parse conversation response: {e}")
+        raise HTTPException(status_code=500, detail="Server returned invalid conversation data")
 
 # Optimized content processing functions
 def is_thinking_content(content: str) -> bool:
@@ -379,10 +335,10 @@ def clean_thinking_content(content: str) -> str:
         return ""
     return content
 
-def clean_reference_markers(content: str) -> str:
-    """Remove reference markers like [这是一个数字](@ref) from content"""
-    # Remove reference markers
-    cleaned = re.sub(r'\[\s*[^\]]+\s*\]\s*$$@ref$$', '', content)
+def remove_reference_patterns(content: str) -> str:
+    """Remove patterns like [这是一个数字](@ref) from content"""
+    # Remove [text](@ref) patterns
+    cleaned = re.sub(r'\[[^\]]+\]$$@ref$$', '', content)
     return cleaned
 
 # Optimized response chunk creation
@@ -422,8 +378,8 @@ async def process_message_event(data: dict, is_first_chunk: bool, in_thinking_bl
     sse_id = data.get('sseId', str(uuid.uuid4()))
     result = ""
 
-    # Clean reference markers from content
-    content = clean_reference_markers(content)
+    # Clean content to remove reference patterns
+    content = remove_reference_patterns(content)
 
     # Check if it's the start of a thinking block
     if "```ys_think" in content and not thinking_started:
@@ -524,24 +480,30 @@ async def verify_api_key(authorization: str = Header(None)):
         raise HTTPException(status_code=401, detail="Invalid API key")
     return api_key
 
-# Prepare messages for better context understanding
-def prepare_messages_for_context(messages: List[dict]) -> str:
-    """Format messages to improve context understanding"""
-    # Extract the last user message
-    last_message = messages[-1]['content']
+# Context preparation function
+def prepare_context_messages(messages: List[dict]) -> str:
+    """Prepare context from messages for better understanding"""
+    # Limit the number of messages to include in context
+    context_messages = messages[-Config.MAX_CONTEXT_MESSAGES:] if len(messages) > Config.MAX_CONTEXT_MESSAGES else messages
     
-    # If there are previous messages, include them for context
-    if len(messages) > 1:
-        context = []
-        for i, msg in enumerate(messages[:-1]):
-            role_prefix = "User: " if msg['role'] == 'user' else "Assistant: "
-            context.append(f"{role_prefix}{msg['content']}")
-        
-        # Format the context and the current message
-        context_str = "\n\n".join(context)
-        return f"Previous conversation:\n{context_str}\n\nCurrent question: {last_message}"
+    # Format messages into a context string
+    context = []
+    for msg in context_messages:
+        role = msg.get('role', 'user')
+        content = msg.get('content', '')
+        if role == 'system':
+            context.append(f"System: {content}")
+        elif role == 'user':
+            context.append(f"User: {content}")
+        elif role == 'assistant':
+            context.append(f"Assistant: {content}")
     
-    return last_message
+    # Join with newlines and limit total length
+    context_text = "\n\n".join(context)
+    if len(context_text) > Config.CONTEXT_TOKEN_LIMIT * 4:  # Rough approximation of tokens to chars
+        context_text = context_text[-(Config.CONTEXT_TOKEN_LIMIT * 4):]
+    
+    return context_text
 
 # Optimized response generation
 async def generate_response(messages: List[dict], model: str, temperature: float, stream: bool,
@@ -549,13 +511,6 @@ async def generate_response(messages: List[dict], model: str, temperature: float
                             frequency_penalty: float = 0, top_p: float = 1.0, 
                             client=None) -> AsyncGenerator[str, None]:
     """Generate response with true streaming and minimal memory usage"""
-    global active_requests, total_requests, failed_requests, empty_responses, last_error_time
-    
-    active_requests += 1
-    total_requests += 1
-    empty_content = True
-    response_started = False
-    
     # Ensure session is initialized
     close_client = False
     if client is None:
@@ -565,15 +520,21 @@ async def generate_response(messages: List[dict], model: str, temperature: float
     try:
         await session_manager.refresh_if_needed(client)
 
-        # Format messages for better context understanding
-        query = prepare_messages_for_context(messages)
+        # Prepare context for better understanding
+        context_text = prepare_context_messages(messages)
+        
+        # Use the last message as the query, but enhance with context
+        last_message = messages[-1]['content']
+        
+        # Prepare enhanced query with context
+        enhanced_query = f"{last_message}\n\nContext from previous messages:\n{context_text}" if len(messages) > 1 else last_message
 
         timestamp = generate_timestamp()
         payload = {
             'userId': session_manager.user_id,
             'botId': Config.BOT_ID,
             'botAlias': 'custom',
-            'query': query,  # Use the formatted query with context
+            'query': enhanced_query,  # Use enhanced query with context
             'isRetry': False,
             'breakingStrategy': 0,
             'isNewConversation': True,
@@ -622,174 +583,80 @@ async def generate_response(messages: List[dict], model: str, temperature: float
         })
 
         # Use stream=True parameter for true streaming
-        for attempt in range(Config.MAX_RETRIES):
-            try:
-                async with client.stream('POST', f"{Config.BASE_URL}/core/conversation/chat/v1",
-                                        headers=headers, content=data) as response:
-                    response.raise_for_status()
+        async with client.stream('POST', f"{Config.BASE_URL}/core/conversation/chat/v1",
+                                headers=headers, content=data) as response:
+            response.raise_for_status()
 
-                    # Process streaming response
-                    is_first_chunk = True
-                    current_event = None
-                    in_thinking_block = False
-                    thinking_content = []
-                    thinking_started = False
-                    buffer = ""
-                    last_activity = time.time()
-                    timeout_seconds = 30  # Timeout for inactivity
+            # Process streaming response
+            is_first_chunk = True
+            current_event = None
+            in_thinking_block = False
+            thinking_content = []
+            thinking_started = False
+            buffer = ""
 
-                    async for raw_line in response.aiter_bytes(1024):
-                        last_activity = time.time()
-                        buffer += raw_line.decode('utf-8', errors='replace')
-                        lines = buffer.split('\n')
-                        buffer = lines.pop()  # Keep the last incomplete line in the buffer
-                        
-                        for line in lines:
-                            line = line.strip()
-                            if not line:
-                                current_event = None
-                                continue
-
-                            # Parse event type
-                            if line.startswith("event:"):
-                                current_event = line[len("event:"):].strip()
-                                continue
-
-                            # Process data line
-                            elif line.startswith("data:"):
-                                json_str = line[len("data:"):].strip()
-                                try:
-                                    data = json.loads(json_str)
-
-                                    # Process message event
-                                    if current_event == "message":
-                                        result, in_thinking_block, thinking_started, is_first_chunk, thinking_content = await process_message_event(
-                                            data, is_first_chunk, in_thinking_block, thinking_started, thinking_content
-                                        )
-                                        if result:
-                                            response_started = True
-                                            empty_content = False
-                                            yield result
-
-                                    # Process generation end event
-                                    elif current_event == "generateEnd":
-                                        for chunk in process_generate_end_event(data, in_thinking_block, thinking_content):
-                                            yield chunk
-                                            response_started = True
-
-                                except json.JSONDecodeError as e:
-                                    logger.error(f"JSON parsing error: {e}")
-                                    continue
-                        
-                        # Check for timeout
-                        if time.time() - last_activity > timeout_seconds:
-                            logger.warning("Response stream timed out due to inactivity")
-                            break
+            async for raw_line in response.aiter_bytes(1024):
+                buffer += raw_line.decode('utf-8', errors='replace')
+                lines = buffer.split('\n')
+                buffer = lines.pop()  # Keep the last incomplete line in the buffer
                 
-                # If we got here without an exception, break the retry loop
-                break
-                
-            except httpx.RequestError as e:
-                failed_requests += 1
-                last_error_time = time.time()
-                
-                if attempt < Config.MAX_RETRIES - 1:
-                    logger.warning(f"Generate response request failed (attempt {attempt+1}/{Config.MAX_RETRIES}): {e}")
-                    await asyncio.sleep(Config.RETRY_DELAY * (attempt + 1))
-                    # Try to reinitialize session before retrying
-                    try:
-                        await session_manager.initialize(client)
-                        logger.info("Session reinitialized before retry")
-                    except Exception as re_init_error:
-                        logger.error(f"Failed to reinitialize session before retry: {re_init_error}")
-                else:
-                    logger.error(f"Failed to generate response after {Config.MAX_RETRIES} attempts: {e}")
-                    # If we haven't started sending a response yet, we can raise an exception
-                    if not response_started:
-                        raise HTTPException(status_code=500, detail=f"Request error: {str(e)}")
-                    else:
-                        # Otherwise, send an error message in the stream
-                        error_chunk = create_chunk(
-                            sse_id=str(uuid.uuid4()),
-                            created=int(time.time()),
-                            content="\n\nI apologize, but I encountered an error while generating the response. Please try again.",
-                            is_first=is_first_chunk
-                        )
-                        yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n"
-                        
-                        # Send end marker
-                        end_chunk = create_chunk(
-                            sse_id=str(uuid.uuid4()),
-                            created=int(time.time()),
-                            finish_reason="stop"
-                        )
-                        yield f"data: {json.dumps(end_chunk, ensure_ascii=False)}\n\n"
-                        yield "data: [DONE]\n\n"
-        
-        # Check if we got an empty response
-        if empty_content:
-            empty_responses += 1
-            logger.warning("Empty response detected")
-            
-            # Send a fallback message
-            fallback_chunk = create_chunk(
-                sse_id=str(uuid.uuid4()),
-                created=int(time.time()),
-                content="I apologize, but I couldn't generate a response. Please try rephrasing your question.",
-                is_first=True
-            )
-            yield f"data: {json.dumps(fallback_chunk, ensure_ascii=False)}\n\n"
-            
-            # Send end marker
-            end_chunk = create_chunk(
-                sse_id=str(uuid.uuid4()),
-                created=int(time.time()),
-                finish_reason="stop"
-            )
-            yield f"data: {json.dumps(end_chunk, ensure_ascii=False)}\n\n"
-            yield "data: [DONE]\n\n"
-            
-    except Exception as e:
-        failed_requests += 1
-        last_error_time = time.time()
-        logger.error(f"Unexpected error in generate_response: {e}")
-        
-        # If we haven't started sending a response yet, we can raise an exception
-        if not response_started:
-            raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
-        else:
-            # Otherwise, send an error message in the stream
-            error_chunk = create_chunk(
-                sse_id=str(uuid.uuid4()),
-                created=int(time.time()),
-                content="\n\nI apologize, but I encountered an unexpected error. Please try again.",
-                is_first=is_first_chunk
-            )
-            yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n"
-            
-            # Send end marker
-            end_chunk = create_chunk(
-                sse_id=str(uuid.uuid4()),
-                created=int(time.time()),
-                finish_reason="stop"
-            )
-            yield f"data: {json.dumps(end_chunk, ensure_ascii=False)}\n\n"
-            yield "data: [DONE]\n\n"
+                for line in lines:
+                    line = line.strip()
+                    if not line:
+                        current_event = None
+                        continue
+
+                    # Parse event type
+                    if line.startswith("event:"):
+                        current_event = line[len("event:"):].strip()
+                        continue
+
+                    # Process data line
+                    elif line.startswith("data:"):
+                        json_str = line[len("data:"):].strip()
+                        try:
+                            data = json.loads(json_str)
+
+                            # Process message event
+                            if current_event == "message":
+                                result, in_thinking_block, thinking_started, is_first_chunk, thinking_content = await process_message_event(
+                                    data, is_first_chunk, in_thinking_block, thinking_started, thinking_content
+                                )
+                                if result:
+                                    yield result
+
+                            # Process generation end event
+                            elif current_event == "generateEnd":
+                                for chunk in process_generate_end_event(data, in_thinking_block, thinking_content):
+                                    yield chunk
+
+                        except json.JSONDecodeError as e:
+                            logger.error(f"JSON parsing error: {e}")
+                            continue
+    except httpx.RequestError as e:
+        logger.error(f"Generate response error: {e}")
+        # Try to reinitialize session
+        try:
+            await session_manager.initialize(client)
+            logger.info("Session reinitialized")
+        except Exception as re_init_error:
+            logger.error(f"Failed to reinitialize session: {re_init_error}")
+        raise HTTPException(status_code=500, detail=f"Request error: {str(e)}")
     finally:
-        active_requests -= 1
         if close_client:
             await client.aclose()
 
 # API endpoints
 @app.get("/")
-async def health():
+async def health(request: Request, background_tasks: BackgroundTasks):
+    """Health check endpoint"""
+    background_tasks.add_task(update_last_activity, request.app)
     return {"status": "ok", "message": "hefengfan API successfully deployed!"}
 
 @app.get("/v1/models")
-async def list_models(background_tasks: BackgroundTasks):
+async def list_models(request: Request, background_tasks: BackgroundTasks):
     """List available models"""
-    # Check memory usage in the background
-    background_tasks.add_task(check_memory_usage, background_tasks)
+    background_tasks.add_task(update_last_activity, request.app)
     
     current_time = int(time.time())
     models_data = [
@@ -818,18 +685,21 @@ async def list_models(background_tasks: BackgroundTasks):
     return {"object": "list", "data": models_data}
 
 @app.post("/v1/chat/completions")
-async def chat_completions(request: ChatCompletionRequest, authorization: str = Header(None), 
-                          req: Request = None, background_tasks: BackgroundTasks = None):
+async def chat_completions(
+    request: ChatCompletionRequest, 
+    authorization: str = Header(None), 
+    req: Request = None,
+    background_tasks: BackgroundTasks = None
+):
     """Process chat completion requests with memory optimization"""
+    # Update last activity time
+    background_tasks.add_task(update_last_activity, req.app)
+    
     # Verify API key
     await verify_api_key(authorization)
 
-    # Check memory usage in the background
-    if background_tasks:
-        background_tasks.add_task(check_memory_usage, background_tasks)
-
     # Add request log
-    logger.info(f"Received chat request: model={request.model}, stream={request.stream}, messages={len(request.messages)}")
+    logger.info(f"Received chat request: model={request.model}, stream={request.stream}")
     messages = [msg.model_dump() for msg in request.messages]
 
     # Get client from app state
@@ -860,6 +730,9 @@ async def chat_completions(request: ChatCompletionRequest, authorization: str = 
                         delta = chunk["choices"][0]["delta"]
                         if "content" in delta:
                             content_part = delta["content"]
+                            
+                            # Remove reference patterns
+                            content_part = remove_reference_patterns(content_part)
 
                             # Process thinking block markers
                             if content_part == "<Thinking>\n\n":
@@ -880,9 +753,6 @@ async def chat_completions(request: ChatCompletionRequest, authorization: str = 
                             meta = delta["meta"]
             except Exception as e:
                 logger.error(f"Error processing non-streaming response: {e}")
-
-        # Clean reference markers from final content
-        content = clean_reference_markers(content)
 
         # Build complete response
         return {
@@ -918,46 +788,51 @@ async def chat_completions(request: ChatCompletionRequest, authorization: str = 
     )
 
 @app.get("/health")
-async def health_check(background_tasks: BackgroundTasks):
-    """Health check endpoint with detailed status"""
-    # Check memory usage in the background
-    background_tasks.add_task(check_memory_usage, background_tasks)
+async def health_check(request: Request, background_tasks: BackgroundTasks):
+    """Health check endpoint with memory stats"""
+    background_tasks.add_task(update_last_activity, request.app)
     
-    status = "ok"
-    details = {
-        "session": "active" if session_manager.is_initialized() else "inactive",
-        "active_requests": active_requests,
-        "total_requests": total_requests,
-        "failed_requests": failed_requests,
-        "empty_responses": empty_responses,
-        "uptime": int(time.time() - app.state.startup_time) if hasattr(app.state, 'startup_time') else 0
+    # Get memory usage
+    memory_info = psutil.virtual_memory()
+    memory_percent = memory_info.percent
+    
+    # Get session status
+    session_status = "active" if session_manager.is_initialized() else "inactive"
+    
+    # Get process info
+    process = psutil.Process()
+    process_memory = process.memory_info().rss / (1024 * 1024)  # MB
+    
+    return {
+        "status": "ok" if memory_percent < 90 and session_status == "active" else "degraded",
+        "session": session_status,
+        "memory": {
+            "total": f"{memory_info.total / (1024 * 1024):.2f} MB",
+            "available": f"{memory_info.available / (1024 * 1024):.2f} MB",
+            "used_percent": f"{memory_percent:.1f}%",
+            "process_memory": f"{process_memory:.2f} MB"
+        },
+        "uptime": f"{time.time() - process.create_time():.0f} seconds"
     }
-    
-    # Check if we need to force garbage collection
-    if active_requests == 0 and time.time() - last_gc_run > 300:  # 5 minutes since last GC
-        background_tasks.add_task(cleanup_memory)
-        details["gc_triggered"] = True
-    
-    # Determine status based on metrics
-    if not session_manager.is_initialized():
-        status = "degraded"
-    elif failed_requests > 10 and failed_requests / max(1, total_requests) > 0.2:  # More than 20% failure rate
-        status = "warning"
-    elif empty_responses > 5 and empty_responses / max(1, total_requests) > 0.1:  # More than 10% empty responses
-        status = "warning"
-    
-    return {"status": status, **details}
 
-@app.on_event("startup")
-async def startup_event():
-    """Application startup event handler"""
-    app.state.startup_time = time.time()
-    logger.info("Application starting up")
+@app.post("/maintenance/cleanup")
+async def force_cleanup(request: Request, background_tasks: BackgroundTasks):
+    """Force memory cleanup"""
+    background_tasks.add_task(update_last_activity, request.app)
     
-    # Initialize session
-    try:
-        client = httpx.AsyncClient(timeout=httpx.Timeout(30))
-        await session_manager.initialize(client)
-        await client.aclose()
-    except Exception as e:
-        logger.error(f"Startup initialization error: {e}")
+    # Get memory before cleanup
+    before_memory = psutil.virtual_memory().percent
+    
+    # Perform cleanup
+    await cleanup_memory()
+    
+    # Get memory after cleanup
+    after_memory = psutil.virtual_memory().percent
+    
+    return {
+        "status": "success",
+        "memory_before": f"{before_memory:.1f}%",
+        "memory_after": f"{after_memory:.1f}%",
+        "reduction": f"{before_memory - after_memory:.1f}%"
+    }
+
