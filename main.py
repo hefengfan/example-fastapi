@@ -5,137 +5,76 @@ import uuid
 import datetime
 import time
 import re
-from fastapi import FastAPI, HTTPException, Header, Request, Depends
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from typing import List, Optional, Dict, Any, AsyncGenerator, Tuple
 import httpx
 import logging
 import hashlib
 import base64
 import hmac
-from fastapi.middleware.cors import CORSMiddleware
-from cachetools import TTLCache, LRUCache
-from contextlib import asynccontextmanager
 
-# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Cache configuration
-# Using TTLCache for time-based expiration and LRUCache for memory management
-TOKEN_CACHE = TTLCache(maxsize=100, ttl=3600)  # Cache tokens for 1 hour
-CONVERSATION_CACHE = LRUCache(maxsize=500)  # Limit to 500 conversations
-RESPONSE_CACHE = TTLCache(maxsize=200, ttl=300)  # Cache responses for 5 minutes
+from fastapi.middleware.cors import CORSMiddleware  # 添加到顶部导入部分
 
-# Lifespan context manager for startup/shutdown events
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Initialize resources on startup
-    try:
-        # Create a global httpx client for reuse
-        app.state.http_client = httpx.AsyncClient(timeout=httpx.Timeout(150))
-        logger.info("Application started, HTTP client initialized")
-        yield
-    finally:
-        # Clean up resources on shutdown
-        await app.state.http_client.aclose()
-        logger.info("Application shutting down, resources cleaned up")
+# 在创建FastAPI实例后添加
+app = FastAPI()
 
-# Create FastAPI app with lifespan
-app = FastAPI(lifespan=lifespan)
-
-# Add CORS middleware
+# 添加CORS中间件
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins, should be more restrictive in production
+    allow_origins=["*"],  # 允许所有来源，生产环境应更严格
     allow_credentials=True,
-    allow_methods=["*"],  # Allow all methods
-    allow_headers=["*"],  # Allow all headers
+    allow_methods=["*"],  # 允许所有方法
+    allow_headers=["*"],  # 允许所有头
 )
 
-# Configuration class for API settings
+
+# 添加配置类来管理API配置
 class Config:
     API_KEY = "TkoWuEN8cpDJubb7Zfwxln16NQDZIc8z"
     BASE_URL = "https://api-bj.wenxiaobai.com/api/v1.0"
     BOT_ID = 200006
     DEFAULT_MODEL = "DeepSeek-R1"
-    # Add cache settings
-    CACHE_ENABLED = True
-    CACHE_TTL = 300  # 5 minutes
-    MAX_CONNECTIONS = 100  # Limit concurrent connections
 
-# Session manager with improved caching
+
+# 添加会话管理类
 class SessionManager:
     def __init__(self):
-        self._sessions = {}
-        self._lock = asyncio.Lock()
-        
-    async def get_session(self, session_id: str = None):
-        """Get or create a session with caching"""
-        session_id = session_id or str(uuid.uuid4())
-        
-        # Check cache first
-        if session_id in self._sessions:
-            session = self._sessions[session_id]
-            # Check if session is still valid
-            if session.get("expires_at", 0) > time.time():
-                return session
-        
-        # Create new session
-        async with self._lock:  # Prevent race conditions
-            device_id = generate_device_id()
-            
-            # Check token cache
-            cache_key = f"token:{device_id}"
-            if cache_key in TOKEN_CACHE:
-                token, user_id = TOKEN_CACHE[cache_key]
-            else:
-                token, user_id = await get_auth_token(device_id)
-                TOKEN_CACHE[cache_key] = (token, user_id)
-            
-            # Check conversation cache
-            conv_cache_key = f"conv:{user_id}"
-            if conv_cache_key in CONVERSATION_CACHE:
-                conversation_id = CONVERSATION_CACHE[conv_cache_key]
-            else:
-                conversation_id = await create_conversation(device_id, token, user_id)
-                CONVERSATION_CACHE[conv_cache_key] = conversation_id
-            
-            # Create session with expiration
-            session = {
-                "device_id": device_id,
-                "token": token,
-                "user_id": user_id,
-                "conversation_id": conversation_id,
-                "created_at": time.time(),
-                "expires_at": time.time() + 3600,  # 1 hour expiration
-                "id": session_id
-            }
-            self._sessions[session_id] = session
-            
-            # Clean up old sessions periodically
-            if len(self._sessions) > 1000:  # Arbitrary limit
-                self._cleanup_sessions()
-                
-            return session
-    
-    def _cleanup_sessions(self):
-        """Remove expired sessions"""
-        current_time = time.time()
-        expired_keys = [k for k, v in self._sessions.items() 
-                       if v.get("expires_at", 0) < current_time]
-        for key in expired_keys:
-            del self._sessions[key]
+        self.device_id = None
+        self.token = None
+        self.user_id = None
+        self.conversation_id = None
 
-# Create session manager instance
+    def initialize(self):
+        """初始化会话"""
+        self.device_id = generate_device_id()
+        self.token, self.user_id = get_auth_token(self.device_id)
+        self.conversation_id = create_conversation(self.device_id, self.token, self.user_id)
+        logger.info(f"Session initialized: user_id={self.user_id}, conversation_id={self.conversation_id}")
+
+    def is_initialized(self):
+        """检查会话是否已初始化"""
+        return all([self.device_id, self.token, self.user_id, self.conversation_id])
+
+    async def refresh_if_needed(self):
+        """如果需要，刷新会话"""
+        if not self.is_initialized():
+            self.initialize()
+
+
+# 创建会话管理器实例
 session_manager = SessionManager()
 
-# Pydantic models for request/response validation
+
 class Message(BaseModel):
     role: str
     content: str
     name: Optional[str] = None
+
 
 class ChatCompletionRequest(BaseModel):
     model: str
@@ -158,24 +97,27 @@ class ModelData(BaseModel):
     root: str
     parent: Optional[str] = None
 
-# Helper functions
+
 def generate_device_id() -> str:
-    """Generate a unique device ID"""
+    """生成设备ID"""
     return f"{uuid.uuid4().hex}_{int(time.time() * 1000)}_{random.randint(100000, 999999)}"
 
+
 def generate_timestamp() -> str:
-    """Generate UTC timestamp in required format"""
+    """生成符合要求的UTC时间字符串"""
     timestamp_ms = int(time.time() * 1000) + 559
     utc_time = datetime.datetime.utcfromtimestamp(timestamp_ms / 1000.0)
     return utc_time.strftime('%a, %d %b %Y %H:%M:%S GMT')
 
+
 def calculate_sha256(data: str) -> str:
-    """Calculate SHA-256 digest"""
+    """计算SHA-256摘要"""
     sha256 = hashlib.sha256(data.encode()).digest()
     return base64.b64encode(sha256).decode()
 
+
 def generate_signature(timestamp: str, digest: str) -> str:
-    """Generate request signature"""
+    """生成请求签名"""
     message = f"x-date: {timestamp}\ndigest: SHA-256={digest}"
     signature = hmac.new(
         Config.API_KEY.encode(),
@@ -184,9 +126,10 @@ def generate_signature(timestamp: str, digest: str) -> str:
     ).digest()
     return base64.b64encode(signature).decode()
 
+
 def create_common_headers(timestamp: str, digest: str, token: Optional[str] = None,
                           device_id: Optional[str] = None) -> dict:
-    """Create common request headers"""
+    """创建通用请求头"""
     headers = {
         'accept': 'application/json, text/plain, */*',
         'accept-language': 'zh-CN,zh;q=0.9',
@@ -223,9 +166,9 @@ def create_common_headers(timestamp: str, digest: str, token: Optional[str] = No
 
     return headers
 
-# Async API functions
-async def get_auth_token(device_id: str) -> Tuple[str, str]:
-    """Get authentication token"""
+
+def get_auth_token(device_id: str) -> Tuple[str, str]:
+    """获取认证令牌"""
     timestamp = generate_timestamp()
     payload = {
         'deviceId': device_id,
@@ -241,24 +184,25 @@ async def get_auth_token(device_id: str) -> Tuple[str, str]:
     headers = create_common_headers(timestamp, digest)
 
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(30)) as client:
-            response = await client.post(
-                f"{Config.BASE_URL}/user/sessions",
-                headers=headers,
-                content=data
-            )
-            response.raise_for_status()
-            result = response.json()
-            return result['data']['token'], result['data']['user']['id']
+        response = httpx.post(
+            f"{Config.BASE_URL}/user/sessions",
+            headers=headers,
+            content=data,
+            timeout=300
+        )
+        response.raise_for_status()
+        result = response.json()
+        return result['data']['token'], result['data']['user']['id']
     except httpx.RequestError as e:
-        logger.error(f"Failed to get auth token: {e}")
-        raise HTTPException(status_code=500, detail=f"Authentication failed: {str(e)}")
+        logger.error(f"获取认证令牌失败: {e}")
+        raise HTTPException(status_code=500, detail=f"认证失败: {str(e)}")
     except (KeyError, json.JSONDecodeError) as e:
-        logger.error(f"Failed to parse auth response: {e}")
-        raise HTTPException(status_code=500, detail="Server returned invalid authentication data")
+        logger.error(f"解析认证响应失败: {e}")
+        raise HTTPException(status_code=500, detail="服务器返回了无效的认证数据")
 
-async def create_conversation(device_id: str, token: str, user_id: str) -> str:
-    """Create a new conversation"""
+
+def create_conversation(device_id: str, token: str, user_id: str) -> str:
+    """创建新的会话"""
     timestamp = generate_timestamp()
     payload = {'visitorId': device_id}
     data = json.dumps(payload, separators=(',', ':'))
@@ -267,36 +211,41 @@ async def create_conversation(device_id: str, token: str, user_id: str) -> str:
     headers = create_common_headers(timestamp, digest, token, device_id)
 
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(30)) as client:
-            response = await client.post(
-                f"{Config.BASE_URL}/core/conversations/users/{user_id}/bots/{Config.BOT_ID}/conversation",
-                headers=headers,
-                content=data
-            )
-            response.raise_for_status()
-            return response.json()['data']
+        response = httpx.post(
+            f"{Config.BASE_URL}/core/conversations/users/{user_id}/bots/{Config.BOT_ID}/conversation",
+            headers=headers,
+            content=data,
+            timeout=300
+        )
+        response.raise_for_status()
+        return response.json()['data']
     except httpx.RequestError as e:
-        logger.error(f"Failed to create conversation: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to create conversation: {str(e)}")
+        logger.error(f"创建会话失败: {e}")
+        raise HTTPException(status_code=500, detail=f"创建会话失败: {str(e)}")
     except (KeyError, json.JSONDecodeError) as e:
-        logger.error(f"Failed to parse conversation response: {e}")
-        raise HTTPException(status_code=500, detail="Server returned invalid conversation data")
+        logger.error(f"解析会话响应失败: {e}")
+        raise HTTPException(status_code=500, detail="服务器返回了无效的会话数据")
 
-# Content processing functions
+
 def is_thinking_content(content: str) -> bool:
-    """Check if content is thinking process"""
+    """判断内容是否为思考过程"""
     return "```ys_think" in content
 
+
 def clean_thinking_content(content: str) -> str:
-    """Clean thinking process content, remove special markers"""
+    """清理思考过程内容，移除特殊标记"""
+    # 移除整个思考块
     if "```ys_think" in content:
+        # 使用正则表达式移除整个思考块
         cleaned = re.sub(r'```ys_think.*?```', '', content, flags=re.DOTALL)
+        # 如果清理后只剩下空白字符，返回空字符串
         if cleaned and cleaned.strip():
             return cleaned.strip()
         return ""
     return content
 
-# Dependency for API key verification
+
+# 辅助函数：验证 API 密钥
 async def verify_api_key(authorization: str = Header(None)):
     if not authorization:
         raise HTTPException(status_code=401, detail="Missing API key")
@@ -306,18 +255,11 @@ async def verify_api_key(authorization: str = Header(None)):
         raise HTTPException(status_code=401, detail="Invalid API key")
     return api_key
 
-# Dependency to get client IP for rate limiting
-async def get_client_ip(request: Request):
-    forwarded = request.headers.get("X-Forwarded-For")
-    if forwarded:
-        return forwarded.split(",")[0]
-    return request.client.host
 
-# Response chunk creation
 def create_chunk(sse_id: str, created: int, content: Optional[str] = None,
                  is_first: bool = False, meta: Optional[dict] = None,
                  finish_reason: Optional[str] = None) -> dict:
-    """Create response chunk"""
+    """创建响应块"""
     delta = {}
 
     if content is not None:
@@ -341,46 +283,46 @@ def create_chunk(sse_id: str, created: int, content: Optional[str] = None,
         }]
     }
 
-# Message event processing
+
 async def process_message_event(data: dict, is_first_chunk: bool, in_thinking_block: bool,
                                 thinking_started: bool, thinking_content: list) -> Tuple[str, bool, bool, bool, list]:
-    """Process message event"""
+    """处理消息事件"""
     content = data.get("content", "")
     timestamp = data.get("timestamp", "")
     created = int(timestamp) // 1000 if timestamp else int(time.time())
     sse_id = data.get('sseId', str(uuid.uuid4()))
     result = ""
 
-    # Check if it's the start of a thinking block
+    # 检查是否是思考块的开始
     if "```ys_think" in content and not thinking_started:
         thinking_started = True
         in_thinking_block = True
-        # Send thinking block start marker
+        # 发送思考块开始标记
         chunk = create_chunk(
             sse_id=sse_id,
             created=created,
-            content="<Thinking>\n\n",
+            content="<think>\n\n",
             is_first=is_first_chunk
-        )
-        result = f"data: \{json.dumps(chunk, ensure_ascii=False)\}\n\n"
-        return result, in_thinking_block, thinking_started, is_first_chunk, thinking_content
-
-    # Check if it's the end of a thinking block
-    if "```" in content and in_thinking_block:
-        in_thinking_block = False
-        # Send thinking block end marker
-        chunk = create_chunk(
-            sse_id=sse_id,
-            created=created,
-            content="\n</Thinking>\n\n"
         )
         result = f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
         return result, in_thinking_block, thinking_started, is_first_chunk, thinking_content
 
-    # If in thinking block, collect thinking content
+    # 检查是否是思考块的结束
+    if "```" in content and in_thinking_block:
+        in_thinking_block = False
+        # 发送思考块结束标记
+        chunk = create_chunk(
+            sse_id=sse_id,
+            created=created,
+            content="\n</think>\n\n"
+        )
+        result = f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+        return result, in_thinking_block, thinking_started, is_first_chunk, thinking_content
+
+    # 如果在思考块内，收集思考内容
     if in_thinking_block:
         thinking_content.append(content)
-        # Also send content in thinking block, but mark as thinking content
+        # 在思考块内也发送内容，但标记为思考内容
         chunk = create_chunk(
             sse_id=sse_id,
             created=created,
@@ -389,12 +331,12 @@ async def process_message_event(data: dict, is_first_chunk: bool, in_thinking_bl
         result = f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
         return result, in_thinking_block, thinking_started, is_first_chunk, thinking_content
 
-    # Clean content, remove thinking blocks
+    # 清理内容，移除思考块
     content = clean_thinking_content(content)
-    if not content:  # Skip if content is empty after cleaning
+    if not content:  # 如果清理后内容为空，跳过
         return result, in_thinking_block, thinking_started, is_first_chunk, thinking_content
 
-    # Send normal content
+    # 正常发送内容
     chunk = create_chunk(
         sse_id=sse_id,
         created=created,
@@ -404,25 +346,24 @@ async def process_message_event(data: dict, is_first_chunk: bool, in_thinking_bl
     result = f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
     return result, in_thinking_block, thinking_started, False, thinking_content
 
-# Generate end event processing
+
 def process_generate_end_event(data: dict, in_thinking_block: bool, thinking_content: list) -> List[str]:
-    """Process generate end event"""
+    """处理生成结束事件"""
     result = []
     timestamp = data.get("timestamp", "")
     created = int(timestamp) // 1000 if timestamp else int(time.time())
     sse_id = data.get('sseId', str(uuid.uuid4()))
 
-    # If thinking block hasn't ended, send end marker
+    # 如果思考块还没有结束，发送结束标记
     if in_thinking_block:
         end_thinking_chunk = create_chunk(
             sse_id=sse_id,
             created=created,
-            content="\n<Thinking>
-</Thinking>\n\n"
+            content="\n</think>\n\n"
         )
         result.append(f"data: {json.dumps(end_thinking_chunk, ensure_ascii=False)}\n\n")
 
-    # Add metadata
+    # 添加元数据
     meta_chunk = create_chunk(
         sse_id=sse_id,
         created=created,
@@ -430,7 +371,7 @@ def process_generate_end_event(data: dict, in_thinking_block: bool, thinking_con
     )
     result.append(f"data: {json.dumps(meta_chunk, ensure_ascii=False)}\n\n")
 
-    # Send end marker
+    # 发送结束标记
     end_chunk = create_chunk(
         sse_id=sse_id,
         created=created,
@@ -440,40 +381,17 @@ def process_generate_end_event(data: dict, in_thinking_block: bool, thinking_con
     result.append("data: [DONE]\n\n")
     return result
 
-# Response generation with improved streaming
+
 async def generate_response(messages: List[dict], model: str, temperature: float, stream: bool,
                             max_tokens: Optional[int] = None, presence_penalty: float = 0,
-                            frequency_penalty: float = 0, top_p: float = 1.0, 
-                            client_ip: str = None) -> AsyncGenerator[str, None]:
-    """Generate response with true streaming"""
-    # Get session
-    session = await session_manager.get_session()
-    
-    # Check cache for identical requests if caching is enabled
-    if Config.CACHE_ENABLED and not stream:
-        cache_key = hashlib.md5(
-            json.dumps({
-                "messages": messages,
-                "model": model,
-                "temperature": temperature,
-                "max_tokens": max_tokens,
-                "presence_penalty": presence_penalty,
-                "frequency_penalty": frequency_penalty,
-                "top_p": top_p
-            }).encode()
-        ).hexdigest()
-        
-        if cache_key in RESPONSE_CACHE:
-            logger.info(f"Cache hit for request {cache_key[:8]}")
-            cached_response = RESPONSE_CACHE[cache_key]
-            # For non-streaming requests, we can return the cached full response
-            if not stream:
-                yield json.dumps(cached_response)
-                return
+                            frequency_penalty: float = 0, top_p: float = 1.0) -> AsyncGenerator[str, None]:
+    """生成响应 - 使用真正的流式处理"""
+    # 确保会话已初始化
+    await session_manager.refresh_if_needed()
 
     timestamp = generate_timestamp()
     payload = {
-        'userId': session["user_id"],
+        'userId': session_manager.user_id,
         'botId': Config.BOT_ID,
         'botAlias': 'custom',
         'query': messages[-1]['content'],
@@ -483,7 +401,7 @@ async def generate_response(messages: List[dict], model: str, temperature: float
         'mediaInfos': [],
         'turnIndex': 0,
         'rewriteQuery': '',
-        'conversationId': session["conversation_id"],
+        'conversationId': session_manager.conversation_id,
         'capabilities': [
             {
                 'capability': 'otherBot',
@@ -516,8 +434,8 @@ async def generate_response(messages: List[dict], model: str, temperature: float
     data = json.dumps(payload, separators=(',', ':'))
     digest = calculate_sha256(data)
 
-    # Create special headers for streaming request
-    headers = create_common_headers(timestamp, digest, session["token"], session["device_id"])
+    # 创建流式请求的特殊头部
+    headers = create_common_headers(timestamp, digest, session_manager.token, session_manager.device_id)
     headers.update({
         'accept': 'text/event-stream, text/event-stream',
         'x-yuanshi-appversioncode': '',
@@ -525,104 +443,71 @@ async def generate_response(messages: List[dict], model: str, temperature: float
     })
 
     try:
-        # Use app's shared HTTP client for better connection reuse
-        async with app.state.http_client.stream('POST', f"{Config.BASE_URL}/core/conversation/chat/v1",
-                                 headers=headers, content=data) as response:
-            response.raise_for_status()
+        # 使用 stream=True 参数，实现真正的流式处理
+        async with httpx.AsyncClient(timeout=httpx.Timeout(150)) as client:
+            async with client.stream('POST', f"{Config.BASE_URL}/core/conversation/chat/v1",
+                                     headers=headers, content=data) as response:
+                response.raise_for_status()
 
-            # Process streaming response
-            is_first_chunk = True
-            current_event = None
-            in_thinking_block = False
-            thinking_content = []
-            thinking_started = False
-            full_response = {"content": "", "thinking_content": ""}
+                # 处理流式响应
+                is_first_chunk = True
+                current_event = None
+                in_thinking_block = False
+                thinking_content = []
+                thinking_started = False
 
-            async for line in response.aiter_lines():
-                line = line.strip()
-                if not line:
-                    current_event = None
-                    continue
-
-                # Parse event type
-                if line.startswith("event:"):
-                    current_event = line[len("event:"):].strip()
-                    continue
-
-                # Process data line
-                elif line.startswith("data:"):
-                    json_str = line[len("data:"):].strip()
-                    try:
-                        data = json.loads(json_str)
-
-                        # Process message event
-                        if current_event == "message":
-                            result, in_thinking_block, thinking_started, is_first_chunk, thinking_content = await process_message_event(
-                                data, is_first_chunk, in_thinking_block, thinking_started, thinking_content
-                            )
-                            
-                            # For caching, collect the full response
-                            if Config.CACHE_ENABLED and not stream:
-                                if "choices" in json.loads(result[6:]):
-                                    chunk_data = json.loads(result[6:])
-                                    if "delta" in chunk_data["choices"][0]:
-                                        delta = chunk_data["choices"][0]["delta"]
-                                        if "content" in delta:
-                                            if in_thinking_block:
-                                                full_response["thinking_content"] += delta["content"]
-                                            else:
-                                                full_response["content"] += delta["content"]
-                            
-                            if result:
-                                yield result
-
-                        # Process generate end event
-                        elif current_event == "generateEnd":
-                            for chunk in process_generate_end_event(data, in_thinking_block, thinking_content):
-                                yield chunk
-                                
-                            # Cache the full response for non-streaming requests
-                            if Config.CACHE_ENABLED and not stream:
-                                cached_response = {
-                                    "id": str(uuid.uuid4()),
-                                    "object": "chat.completion",
-                                    "created": int(time.time()),
-                                    "model": model,
-                                    "choices": [{
-                                        "message": {
-                                            "role": "assistant",
-                                            "reasoning_content": f"<Thinking>\n\{full_response['thinking_content']\}\n</Thinking>" if full_response["thinking_content"] else None,
-                                            "content": full_response["content"],
-                                        },
-                                        "finish_reason": "stop"
-                                    }]
-                                }
-                                RESPONSE_CACHE[cache_key] = cached_response
-
-                    except json.JSONDecodeError as e:
-                        logger.error(f"JSON parsing error: {e}")
+                async for line in response.aiter_lines():
+                    line = line.strip()
+                    if not line:
+                        current_event = None
                         continue
 
-    except httpx.RequestError as e:
-        logger.error(f"Error generating response: {e}")
-        # Try to reinitialize session
-        try:
-            await session_manager.get_session(None)  # Force new session
-            logger.info("Session reinitialized")
-        except Exception as re_init_error:
-            logger.error(f"Failed to reinitialize session: {re_init_error}")
-        raise HTTPException(status_code=500, detail=f"Request error: {str(e)}")
+                    # 解析事件类型
+                    if line.startswith("event:"):
+                        current_event = line[len("event:"):].strip()
+                        continue
 
-# API endpoints
+                    # 处理数据行
+                    elif line.startswith("data:"):
+                        json_str = line[len("data:"):].strip()
+                        try:
+                            data = json.loads(json_str)
+
+                            # 处理消息事件
+                            if current_event == "message":
+                                result, in_thinking_block, thinking_started, is_first_chunk, thinking_content = await process_message_event(
+                                    data, is_first_chunk, in_thinking_block, thinking_started, thinking_content
+                                )
+                                if result:
+                                    yield result
+
+                            # 处理生成结束事件
+                            elif current_event == "generateEnd":
+                                for chunk in process_generate_end_event(data, in_thinking_block, thinking_content):
+                                    yield chunk
+
+                        except json.JSONDecodeError as e:
+                            logger.error(f"JSON解析错误: {e}")
+                            continue
+
+    except httpx.RequestError as e:
+        logger.error(f"生成响应错误: {e}")
+        # 尝试重新初始化会话
+        try:
+            session_manager.initialize()
+            logger.info("会话已重新初始化")
+        except Exception as re_init_error:
+            logger.error(f"重新初始化会话失败: {re_init_error}")
+        raise HTTPException(status_code=500, detail=f"请求错误: {str(e)}")
+
 @app.get("/")
-async def root():
-    return {"status": "ok", "message": "hefengfan API successfully deployed!"}
+async def hff():
+    return {"status": "ok", "提示": "hefengfan接口已成功部署！"}
+
 
 @app.get("/v1/models")
-async def list_models(authorization: str = Header(None)):
-    """List available models"""
-    await verify_api_key(authorization)
-    
+async def list_models():
+    """列出可用模型"""
     current_time = int(time.time())
     models_data = [
         ModelData(
@@ -649,22 +534,19 @@ async def list_models(authorization: str = Header(None)):
 
     return {"object": "list", "data": models_data}
 
+
 @app.post("/v1/chat/completions")
-async def chat_completions(
-    request: ChatCompletionRequest, 
-    authorization: str = Header(None),
-    client_ip: str = Depends(get_client_ip)
-):
-    """Handle chat completion requests"""
-    # Verify API key
+async def chat_completions(request: ChatCompletionRequest, authorization: str = Header(None)):
+    """处理聊天完成请求"""
+    # 验证 API 密钥
     await verify_api_key(authorization)
 
-    # Add request log
-    logger.info(f"Received chat request: model={request.model}, stream={request.stream}, client={client_ip}")
+    # 添加请求日志
+    logger.info(f"Received chat request: model={request.model}, stream={request.stream}")
     messages = [msg.model_dump() for msg in request.messages]
 
     if not request.stream:
-        # Non-streaming response handling
+        # 非流式响应处理
         content = ""
         thinking_content = ""
         meta = None
@@ -674,12 +556,11 @@ async def chat_completions(
                 messages=messages,
                 model=request.model,
                 temperature=request.temperature,
-                stream=True,  # Still use streaming internally
+                stream=True,  # 内部仍使用流式处理
                 max_tokens=request.max_tokens,
                 presence_penalty=request.presence_penalty,
                 frequency_penalty=request.frequency_penalty,
-                top_p=request.top_p,
-                client_ip=client_ip
+                top_p=request.top_p
         ):
             try:
                 if chunk_str.startswith("data: ") and not chunk_str.startswith("data: [DONE]"):
@@ -689,27 +570,27 @@ async def chat_completions(
                         if "content" in delta:
                             content_part = delta["content"]
 
-                            # Handle thinking block markers
-                            if content_part == "<Thinking>\n\n":
+                            # 处理思考块标记
+                            if content_part == "<think>\n\n":
                                 in_thinking = True
                                 continue
-                            elif content_part == "\n</Thinking>\n\n":
+                            elif content_part == "\n</think>\n\n":
                                 in_thinking = False
                                 continue
 
-                            # Collect content
+                            # 收集内容
                             if in_thinking:
                                 thinking_content += content_part
                             else:
                                 content += content_part
 
-                        # Collect metadata
+                        # 收集元数据
                         if "meta" in delta:
                             meta = delta["meta"]
             except Exception as e:
-                logger.error(f"Error processing non-streaming response: {e}")
+                logger.error(f"处理非流式响应错误: {e}")
 
-        # Build complete response
+        # 构建完整响应
         return {
             "id": str(uuid.uuid4()),
             "object": "chat.completion",
@@ -718,7 +599,7 @@ async def chat_completions(
             "choices": [{
                 "message": {
                     "role": "assistant",
-                    "reasoning_content": f"<Thinking>\n\{thinking_content\}\n</Thinking>" if thinking_content else None,
+                    "reasoning_content": f"<think>\n{thinking_content}\n</think>" if thinking_content else None,
                     "content": content,
                     "meta": meta
                 },
@@ -726,7 +607,7 @@ async def chat_completions(
             }]
         }
 
-    # Streaming response
+    # 流式响应
     return StreamingResponse(
         generate_response(
             messages=messages,
@@ -736,28 +617,26 @@ async def chat_completions(
             max_tokens=request.max_tokens,
             presence_penalty=request.presence_penalty,
             frequency_penalty=request.frequency_penalty,
-            top_p=request.top_p,
-            client_ip=client_ip
+            top_p=request.top_p
         ),
         media_type="text/event-stream"
     )
 
+
+@app.on_event("startup")
+async def startup_event():
+    """应用启动时初始化会话"""
+    try:
+        session_manager.initialize()
+    except Exception as e:
+        logger.error(f"启动初始化错误: {e}")
+        raise
+
+
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
-    try:
-        # Test if we can create a session
-        session = await session_manager.get_session()
-        return {
-            "status": "ok", 
-            "session": "active",
-            "cache_stats": {
-                "token_cache": len(TOKEN_CACHE),
-                "conversation_cache": len(CONVERSATION_CACHE),
-                "response_cache": len(RESPONSE_CACHE)
-            }
-        }
-    except Exception as e:
-        return {"status": "degraded", "session": "inactive", "error": str(e)}
-
-# Run with: uvicorn main:app --host 0.0.0.0 --port 8000 --workers 4
+    """健康检查端点"""
+    if session_manager.is_initialized():
+        return {"status": "ok", "session": "active"}
+    else:
+        return {"status": "degraded", "session": "inactive"}
