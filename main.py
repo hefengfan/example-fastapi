@@ -336,17 +336,17 @@ def create_conversation(device_id: str, token: str, user_id: str) -> str:
 
 
 def is_thinking_content(content: str) -> bool:
-    """Determine if content is thinking process"""
-    return "\`\`\`ys_think" in content
+    """判断内容是否为思考过程"""
+    return "```ys_think" in content
 
 
 def clean_thinking_content(content: str) -> str:
-    """Clean thinking process content, remove special markers"""
-    # Remove entire thinking block
-    if "\`\`\`ys_think" in content:
-        # Use regex to remove entire thinking block
-        cleaned = re.sub(r'\`\`\`ys_think.*?\`\`\`', '', content, flags=re.DOTALL)
-        # If only whitespace remains after cleaning, return empty string
+    """清理思考过程内容，移除特殊标记"""
+    # 移除整个思考块
+    if "```ys_think" in content:
+        # 使用正则表达式移除整个思考块
+        cleaned = re.sub(r'```ys_think.*?```', '', content, flags=re.DOTALL)
+        # 如果清理后只剩下空白字符，返回空字符串
         if cleaned and cleaned.strip():
             return cleaned.strip()
         return ""
@@ -357,7 +357,7 @@ def clean_thinking_content(content: str) -> str:
 def remove_reference_annotations(content: str) -> str:
     """Remove reference annotations like [1](@ref) from content"""
     # Pattern to match [number](@ref) or similar reference annotations
-    pattern = r'\[\d+\]$$@ref$$'
+    pattern = r'$$\d+$$$@ref$'
     cleaned_content = re.sub(pattern, '', content)
     return cleaned_content
 
