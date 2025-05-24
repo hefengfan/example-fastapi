@@ -448,13 +448,13 @@ async def process_message_event(data: dict, is_first_chunk: bool, in_thinking_bl
         result = f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
         return result, in_thinking_block, thinking_started, is_first_chunk, thinking_content
 
+    # Remove reference annotations
+    content = remove_reference_annotations(content)
+                                    
     # Clean content, remove thinking block
     content = clean_thinking_content(content)
     if not content:  # If content is empty after cleaning, skip
         return result, in_thinking_block, thinking_started, is_first_chunk, thinking_content
-
-    # Remove reference annotations
-    content = remove_reference_annotations(content)
 
     # Send normal content
     chunk = create_chunk(
