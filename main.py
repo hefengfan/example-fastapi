@@ -6,8 +6,9 @@ import datetime
 import time
 import re
 import gc
-import psutil
 import threading
+import os
+import sys
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -55,8 +56,7 @@ class MemoryManager:
         """Monitor memory usage and trigger cleanup when necessary"""
         while self.is_running:
             try:
-                memory_info = psutil.virtual_memory()
-                memory_percent = memory_info.percent
+                memory_percent = self.get_memory_usage()
                 
                 logger.info(f"Current memory usage: {memory_percent:.1f}%")
                 
@@ -68,6 +68,50 @@ class MemoryManager:
                 logger.error(f"Error in memory monitoring: {e}")
                 
             time.sleep(self.check_interval)
+    
+    def get_memory_usage(self):
+        """Get current memory usage percentage using built-in methods"""
+        try:
+            # Try to use resource module (Unix-like systems)
+            import resource
+            usage = resource.getrusage(resource.RUSAGE_SELF)
+            # Convert to MB (ru_maxrss is in KB on Linux, bytes on macOS)
+            if sys.platform == 'darwin':  # macOS
+                mem_used = usage.ru_maxrss / 1024 / 1024
+            else:  # Linux
+                mem_used = usage.ru_maxrss / 1024
+                
+            # Get total memory from /proc/meminfo on Linux
+            total_mem = self._get_total_memory()
+            if total_mem > 0:
+                return (mem_used / total_mem) * 100
+            
+            # Fallback: estimate based on process size relative to expected total
+            # Assuming the server has 500MB as mentioned
+            return (mem_used / 500) * 100
+            
+        except ImportError:
+            # Fallback for systems without resource module
+            # Use a simple heuristic based on available objects
+            gc.collect()  # Collect first to get accurate count
+            obj_count = len(gc.get_objects())
+            # Rough estimate - adjust threshold based on testing
+            threshold = 1000000  # Arbitrary large number of objects
+            return (obj_count / threshold) * 100
+    
+    def _get_total_memory(self):
+        """Get total system memory in MB"""
+        try:
+            # Try to read from /proc/meminfo on Linux
+            if os.path.exists('/proc/meminfo'):
+                with open('/proc/meminfo', 'r') as f:
+                    for line in f:
+                        if 'MemTotal' in line:
+                            # Extract value in KB and convert to MB
+                            return int(line.split()[1]) / 1024
+            return 0
+        except:
+            return 0
     
     def cleanup_memory(self):
         """Perform memory cleanup operations"""
@@ -91,8 +135,8 @@ class MemoryManager:
             pass
         
         # Log memory after cleanup
-        memory_info = psutil.virtual_memory()
-        logger.info(f"Memory after cleanup: {memory_info.percent:.1f}%")
+        memory_percent = self.get_memory_usage()
+        logger.info(f"Memory after cleanup: {memory_percent:.1f}%")
 
 # Initialize memory manager
 memory_manager = MemoryManager(threshold_percent=75, check_interval=30)
@@ -705,27 +749,96 @@ async def chat_completions(request: ChatCompletionRequest, authorization: str = 
 @app.get("/memory")
 async def memory_status():
     """Get memory status"""
-    memory_info = psutil.virtual_memory()
-    return {
-        "total": memory_info.total,
-        "available": memory_info.available,
-        "percent": memory_info.percent,
-        "used": memory_info.used,
-        "free": memory_info.free
-    }
+    try:
+        import resource
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        if sys.platform == 'darwin':  # macOS
+            mem_used = usage.ru_maxrss / 1024 / 1024
+        else:  # Linux
+            mem_used = usage.ru_maxrss / 1024
+        
+        # Get total memory if possible
+        total_mem = 0
+        if os.path.exists('/proc/meminfo'):
+            with open('/proc/meminfo', 'r') as f:
+                for line in f:
+                    if 'MemTotal' in line:
+                        total_mem = int(line.split()[1]) / 1024
+                        break
+        
+        # Get free memory if possible
+        free_mem = 0
+        if os.path.exists('/proc/meminfo'):
+            with open('/proc/meminfo', 'r') as f:
+                for line in f:
+                    if 'MemAvailable' in line:
+                        free_mem = int(line.split()[1]) / 1024
+                        break
+        
+        # Calculate percentage if we have total memory
+        percent = (mem_used / total_mem * 100) if total_mem > 0 else 0
+        
+        return {
+            "process_memory_mb": round(mem_used, 2),
+            "total_memory_mb": round(total_mem, 2) if total_mem > 0 else "unknown",
+            "available_memory_mb": round(free_mem, 2) if free_mem > 0 else "unknown",
+            "memory_percent": round(percent, 2) if percent > 0 else "unknown",
+            "gc_objects": len(gc.get_objects())
+        }
+    except ImportError:
+        # Fallback if resource module is not available
+        return {
+            "gc_objects": len(gc.get_objects()),
+            "note": "Limited memory information available (resource module not found)"
+        }
 
 
 @app.post("/memory/cleanup")
 async def trigger_cleanup():
     """Manually trigger memory cleanup"""
-    memory_before = psutil.virtual_memory().percent
+    # Get memory before cleanup
+    try:
+        import resource
+        usage_before = resource.getrusage(resource.RUSAGE_SELF)
+        if sys.platform == 'darwin':  # macOS
+            mem_before = usage_before.ru_maxrss / 1024 / 1024
+        else:  # Linux
+            mem_before = usage_before.ru_maxrss / 1024
+    except ImportError:
+        mem_before = 0
+    
+    # Count objects before cleanup
+    obj_count_before = len(gc.get_objects())
+    
+    # Perform cleanup
     memory_manager.cleanup_memory()
-    memory_after = psutil.virtual_memory().percent
+    
+    # Get memory after cleanup
+    try:
+        import resource
+        usage_after = resource.getrusage(resource.RUSAGE_SELF)
+        if sys.platform == 'darwin':  # macOS
+            mem_after = usage_after.ru_maxrss / 1024 / 1024
+        else:  # Linux
+            mem_after = usage_after.ru_maxrss / 1024
+        
+        mem_diff = mem_before - mem_after
+    except ImportError:
+        mem_after = 0
+        mem_diff = 0
+    
+    # Count objects after cleanup
+    obj_count_after = len(gc.get_objects())
+    obj_diff = obj_count_before - obj_count_after
+    
     return {
         "status": "success",
-        "memory_before": memory_before,
-        "memory_after": memory_after,
-        "difference": memory_before - memory_after
+        "memory_before_mb": round(mem_before, 2) if mem_before > 0 else "unknown",
+        "memory_after_mb": round(mem_after, 2) if mem_after > 0 else "unknown",
+        "memory_difference_mb": round(mem_diff, 2) if mem_diff != 0 else "unknown",
+        "objects_before": obj_count_before,
+        "objects_after": obj_count_after,
+        "objects_difference": obj_diff
     }
 
 
@@ -745,21 +858,46 @@ async def startup_event():
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
-    memory_info = psutil.virtual_memory()
-    
-    if session_manager.is_initialized():
+    try:
+        # Get memory usage
+        import resource
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        if sys.platform == 'darwin':  # macOS
+            mem_used = usage.ru_maxrss / 1024 / 1024
+        else:  # Linux
+            mem_used = usage.ru_maxrss / 1024
+        
+        # Get total memory if possible
+        total_mem = 0
+        if os.path.exists('/proc/meminfo'):
+            with open('/proc/meminfo', 'r') as f:
+                for line in f:
+                    if 'MemTotal' in line:
+                        total_mem = int(line.split()[1]) / 1024
+                        break
+        
+        # Calculate percentage if we have total memory
+        percent = (mem_used / total_mem * 100) if total_mem > 0 else 0
+        
+        # Determine status
         status = "ok"
-        if memory_info.percent > 90:
+        if percent > 90:
             status = "warning"
             # Trigger cleanup if memory usage is very high
             memory_manager.cleanup_memory()
-            
+    except ImportError:
+        # Fallback if resource module is not available
+        status = "ok"
+        percent = 0
+        mem_used = 0
+    
+    if session_manager.is_initialized():
         return {
             "status": status, 
             "session": "active",
             "memory": {
-                "percent": memory_info.percent,
-                "available_mb": memory_info.available / (1024 * 1024)
+                "percent": round(percent, 2) if percent > 0 else "unknown",
+                "used_mb": round(mem_used, 2) if mem_used > 0 else "unknown"
             }
         }
     else:
