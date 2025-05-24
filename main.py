@@ -9,7 +9,7 @@ import gc
 import threading
 import os
 import sys
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, BackgroundTasks
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any, AsyncGenerator, Tuple
@@ -18,23 +18,12 @@ import logging
 import hashlib
 import base64
 import hmac
+from contextlib import asynccontextmanager
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 from fastapi.middleware.cors import CORSMiddleware
-
-# Create FastAPI instance
-app = FastAPI()
-
-# Add CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 # Enhanced Memory management configuration
 class MemoryManager:
@@ -51,22 +40,22 @@ class MemoryManager:
         """Start the memory monitoring and auto cleanup threads"""
         if not self.is_running:
             self.is_running = True
-            # Start memory monitoring thread
+            # Memory monitoring thread
             self.monitor_thread = threading.Thread(target=self._monitor_memory, daemon=True)
             self.monitor_thread.start()
-            # Start auto cleanup thread
+            # Auto cleanup thread
             self.auto_cleanup_thread = threading.Thread(target=self._auto_cleanup, daemon=True)
             self.auto_cleanup_thread.start()
             logger.info("Memory monitoring and auto cleanup started")
     
     def _auto_cleanup(self):
-        """Periodic automatic memory cleanup"""
+        """Periodic automatic cleanup"""
         while self.is_running:
             try:
                 time.sleep(self.auto_cleanup_interval)
                 current_time = time.time()
                 if current_time - self.last_cleanup >= self.auto_cleanup_interval:
-                    logger.info("Performing scheduled memory cleanup")
+                    logger.info("Performing scheduled automatic cleanup")
                     self.cleanup_memory()
                     self.last_cleanup = current_time
             except Exception as e:
@@ -123,8 +112,8 @@ class MemoryManager:
     
     def cleanup_memory(self):
         """Enhanced memory cleanup operations"""
-        # Force garbage collection for all generations
-        collected = gc.collect()
+        # Force garbage collection
+        collected = gc.collect(generation=2)
         logger.info(f"Garbage collection: collected {collected} objects")
         
         # Clear httpx cache
@@ -134,14 +123,23 @@ class MemoryManager:
         except:
             pass
         
-        # Clear session cache if exists
+        # Clear any cached responses
         try:
-            if hasattr(session_manager, '_cache'):
-                session_manager._cache.clear()
+            import sys
+            for module_name in list(sys.modules.keys()):
+                if hasattr(sys.modules[module_name], '__dict__'):
+                    module_dict = sys.modules[module_name].__dict__
+                    for attr_name in list(module_dict.keys()):
+                        if attr_name.startswith('_cache') or attr_name.endswith('_cache'):
+                            try:
+                                if hasattr(module_dict[attr_name], 'clear'):
+                                    module_dict[attr_name].clear()
+                            except:
+                                pass
         except:
             pass
         
-        # System-level memory optimization
+        # Memory fragmentation cleanup
         try:
             import ctypes
             ctypes.CDLL('libc.so.6').malloc_trim(0)
@@ -152,98 +150,74 @@ class MemoryManager:
         memory_percent = self.get_memory_usage()
         logger.info(f"Memory after cleanup: {memory_percent:.1f}%")
 
-# Initialize enhanced memory manager
-memory_manager = MemoryManager(threshold_percent=70, check_interval=20, auto_cleanup_interval=180)
-
-class Config:
-    API_KEY = "TkoWuEN8cpDJubb7Zfwxln16NQDZIc8z"
-    BASE_URL = "https://api-bj.wenxiaobai.com/api/v1.0"
-    BOT_ID = 200006
-    DEFAULT_MODEL = "DeepSeek-R1"
-
-# Enhanced session management with context support
+# Enhanced session management with connection pooling
 class SessionManager:
     def __init__(self):
         self.device_id = None
         self.token = None
         self.user_id = None
         self.conversation_id = None
-        self.conversation_history = []  # Store conversation context
-        self.max_history = 20  # Keep last 20 messages for context
-        self._cache = {}  # Session cache
+        self.client = None
+        self.last_activity = time.time()
+        self.session_timeout = 3600  # 1 hour timeout
         
-    def add_to_history(self, role: str, content: str):
-        """Add message to conversation history"""
-        self.conversation_history.append({
-            "role": role,
-            "content": content,
-            "timestamp": time.time()
-        })
-        
-        # Keep only recent messages
-        if len(self.conversation_history) > self.max_history:
-            self.conversation_history = self.conversation_history[-self.max_history:]
+    async def get_client(self):
+        """Get or create HTTP client with connection pooling"""
+        if self.client is None:
+            # Create client with connection pooling for better performance
+            limits = httpx.Limits(max_keepalive_connections=5, max_connections=10)
+            timeout = httpx.Timeout(30.0, connect=10.0)
+            self.client = httpx.AsyncClient(limits=limits, timeout=timeout)
+        return self.client
     
-    def get_context_messages(self, current_messages: List[dict]) -> List[dict]:
-        """Get messages with context from history"""
-        # Combine history with current messages, avoiding duplicates
-        context_messages = []
-        
-        # Add recent history (excluding the last message to avoid duplication)
-        for msg in self.conversation_history[:-1]:
-            context_messages.append({
-                "role": msg["role"],
-                "content": msg["content"]
-            })
-        
-        # Add current messages
-        context_messages.extend(current_messages)
-        
-        return context_messages
+    async def close_client(self):
+        """Close HTTP client"""
+        if self.client:
+            await self.client.aclose()
+            self.client = None
 
-    def initialize(self):
-        """Initialize session with caching"""
-        cache_key = "session_data"
-        
-        # Try to use cached session if recent
-        if cache_key in self._cache:
-            cached_data = self._cache[cache_key]
-            if time.time() - cached_data.get('timestamp', 0) < 3600:  # 1 hour cache
-                self.device_id = cached_data['device_id']
-                self.token = cached_data['token']
-                self.user_id = cached_data['user_id']
-                self.conversation_id = cached_data['conversation_id']
-                logger.info("Using cached session data")
-                return
-        
-        # Create new session
-        self.device_id = generate_device_id()
-        self.token, self.user_id = get_auth_token(self.device_id)
-        self.conversation_id = create_conversation(self.device_id, self.token, self.user_id)
-        
-        # Cache session data
-        self._cache[cache_key] = {
-            'device_id': self.device_id,
-            'token': self.token,
-            'user_id': self.user_id,
-            'conversation_id': self.conversation_id,
-            'timestamp': time.time()
-        }
-        
-        logger.info(f"New session initialized: user_id={self.user_id}, conversation_id={self.conversation_id}")
+    async def initialize(self):
+        """Initialize session with improved error handling"""
+        try:
+            self.device_id = generate_device_id()
+            self.token, self.user_id = await get_auth_token_async(self.device_id)
+            self.conversation_id = await create_conversation_async(self.device_id, self.token, self.user_id)
+            self.last_activity = time.time()
+            logger.info(f"Session initialized: user_id={self.user_id}, conversation_id={self.conversation_id}")
+        except Exception as e:
+            logger.error(f"Session initialization failed: {e}")
+            raise
 
     def is_initialized(self):
-        """Check if session is initialized"""
-        return all([self.device_id, self.token, self.user_id, self.conversation_id])
+        """Check if session is initialized and not expired"""
+        if not all([self.device_id, self.token, self.user_id, self.conversation_id]):
+            return False
+        
+        # Check if session has expired
+        if time.time() - self.last_activity > self.session_timeout:
+            logger.info("Session expired, will reinitialize")
+            return False
+            
+        return True
 
     async def refresh_if_needed(self):
         """Refresh session if needed"""
         if not self.is_initialized():
-            self.initialize()
+            await self.initialize()
+        self.last_activity = time.time()
 
-# Create enhanced session manager
+# Configuration
+class Config:
+    API_KEY = "TkoWuEN8cpDJubb7Zfwxln16NQDZIc8z"
+    BASE_URL = "https://api-bj.wenxiaobai.com/api/v1.0"
+    BOT_ID = 200006
+    DEFAULT_MODEL = "DeepSeek-R1"
+
+# Initialize managers
+memory_manager = MemoryManager(threshold_percent=70, check_interval=20, auto_cleanup_interval=180)
 session_manager = SessionManager()
 
+# Pydantic models
 class Message(BaseModel):
     role: str
     content: str
@@ -270,12 +244,13 @@ class ModelData(BaseModel):
     root: str
     parent: Optional[str] = None
 
+# Utility functions
 def generate_device_id() -> str:
     """Generate device ID"""
     return f"{uuid.uuid4().hex}_{int(time.time() * 1000)}_{random.randint(100000, 999999)}"
 
 def generate_timestamp() -> str:
-    """Generate UTC time string as required"""
+    """Generate UTC time string"""
     timestamp_ms = int(time.time() * 1000) + 559
     utc_time = datetime.datetime.utcfromtimestamp(timestamp_ms / 1000.0)
     return utc_time.strftime('%a, %d %b %Y %H:%M:%S GMT')
@@ -333,8 +308,9 @@ def create_common_headers(timestamp: str, digest: str, token: Optional[str] = No
 
     return headers
 
-def get_auth_token(device_id: str) -> Tuple[str, str]:
-    """Get authentication token"""
+# Async versions for better performance
+async def get_auth_token_async(device_id: str) -> Tuple[str, str]:
+    """Get authentication token asynchronously"""
     timestamp = generate_timestamp()
     payload = {
         'deviceId': device_id,
@@ -348,12 +324,12 @@ def get_auth_token(device_id: str) -> Tuple[str, str]:
     digest = calculate_sha256(data)
     headers = create_common_headers(timestamp, digest)
 
+    client = await session_manager.get_client()
     try:
-        response = httpx.post(
+        response = await client.post(
             f"{Config.BASE_URL}/user/sessions",
             headers=headers,
-            content=data,
-            timeout=30  # Reduced timeout for faster response
+            content=data
         )
         response.raise_for_status()
         result = response.json()
@@ -362,26 +338,32 @@ def get_auth_token(device_id: str) -> Tuple[str, str]:
         logger.error(f"Failed to get auth token: {e}")
         raise HTTPException(status_code=500, detail=f"Authentication failed: {str(e)}")
 
-def create_conversation(device_id: str, token: str, user_id: str) -> str:
-    """Create new conversation"""
+async def create_conversation_async(device_id: str, token: str, user_id: str) -> str:
+    """Create new conversation asynchronously"""
     timestamp = generate_timestamp()
     payload = {'visitorId': device_id}
     data = json.dumps(payload, separators=(',', ':'))
     digest = calculate_sha256(data)
     headers = create_common_headers(timestamp, digest, token, device_id)
 
+    client = await session_manager.get_client()
     try:
-        response = httpx.post(
+        response = await client.post(
             f"{Config.BASE_URL}/core/conversations/users/{user_id}/bots/{Config.BOT_ID}/conversation",
             headers=headers,
-            content=data,
-            timeout=30  # Reduced timeout
+            content=data
         )
         response.raise_for_status()
         return response.json()['data']
     except httpx.RequestError as e:
         logger.error(f"Failed to create conversation: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to create conversation: {str(e)}")
+
+# Content processing functions
+def remove_reference_annotations(content: str) -> str:
+    """Remove reference annotations like [1](@ref) from content"""
+    pattern = r'\[\d+\]$$@ref$$'
+    return re.sub(pattern, '', content)
 
 def clean_thinking_content(content: str) -> str:
     """Clean thinking process content"""
@@ -392,33 +374,7 @@ def clean_thinking_content(content: str) -> str:
         return ""
     return content
 
-def remove_reference_annotations(content: str) -> str:
-    """Enhanced removal of reference annotations"""
-    # Remove various patterns of reference annotations
-    patterns = [
-        r'\[\d+\]$$@ref$$',  # [1](@ref)
-        r'\[这是一个数字\]$$@ref$$',  # [这是一个数字](@ref)
-        r'\[.*?\]$$@ref$$',  # Any text in brackets with (@ref)
-        r'\[\d+\]',  # Simple [1] patterns
-        r'@ref',  # Standalone @ref
-    ]
-    
-    cleaned_content = content
-    for pattern in patterns:
-        cleaned_content = re.sub(pattern, '', cleaned_content)
-    
-    # Clean up extra spaces
-    cleaned_content = re.sub(r'\s+', ' ', cleaned_content).strip()
-    return cleaned_content
-
-async def verify_api_key(authorization: str = Header(None)):
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Missing API key")
-    api_key = authorization.replace("Bearer ", "").strip()
-    if api_key != Config.API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API key")
-    return api_key
-
+# Response processing functions
 def create_chunk(sse_id: str, created: int, content: Optional[str] = None,
                  is_first: bool = False, meta: Optional[dict] = None,
                  finish_reason: Optional[str] = None) -> dict:
@@ -446,7 +402,7 @@ def create_chunk(sse_id: str, created: int, content: Optional[str] = None,
 
 async def process_message_event(data: dict, is_first_chunk: bool, in_thinking_block: bool,
                                 thinking_started: bool, thinking_content: list) -> Tuple[str, bool, bool, bool, list]:
-    """Process message event with enhanced cleaning"""
+    """Process message event"""
     content = data.get("content", "")
     timestamp = data.get("timestamp", "")
     created = int(timestamp) // 1000 if timestamp else int(time.time())
@@ -473,66 +429,34 @@ async def process_message_event(data: dict, is_first_chunk: bool, in_thinking_bl
         result = f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
         return result, in_thinking_block, thinking_started, is_first_chunk, thinking_content
 
-    # Clean content
+    # Clean and process normal content
     content = clean_thinking_content(content)
     if not content:
         return result, in_thinking_block, thinking_started, is_first_chunk, thinking_content
 
-    # Enhanced reference annotation removal
     content = remove_reference_annotations(content)
-    if not content.strip():  # Skip if content becomes empty after cleaning
-        return result, in_thinking_block, thinking_started, is_first_chunk, thinking_content
-
     chunk = create_chunk(sse_id=sse_id, created=created, content=content, is_first=is_first_chunk)
     result = f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
     return result, in_thinking_block, thinking_started, False, thinking_content
 
-def process_generate_end_event(data: dict, in_thinking_block: bool, thinking_content: list) -> List[str]:
-    """Process generation end event"""
-    result = []
-    timestamp = data.get("timestamp", "")
-    created = int(timestamp) // 1000 if timestamp else int(time.time())
-    sse_id = data.get('sseId', str(uuid.uuid4()))
-
-    if in_thinking_block:
-        end_thinking_chunk = create_chunk(sse_id=sse_id, created=created, content="\n<Thinking>
-</Thinking>\n\n")
-        result.append(f"data: {json.dumps(end_thinking_chunk, ensure_ascii=False)}\n\n")
-
-    meta_chunk = create_chunk(sse_id=sse_id, created=created, 
-                             meta={"thinking_content": "".join(thinking_content) if thinking_content else None})
-    result.append(f"data: {json.dumps(meta_chunk, ensure_ascii=False)}\n\n")
-
-    end_chunk = create_chunk(sse_id=sse_id, created=created, finish_reason="stop")
-    result.append(f"data: {json.dumps(end_chunk, ensure_ascii=False)}\n\n")
-    result.append("data: [DONE]\n\n")
-    return result
-
+# Enhanced response generation with better performance
 async def generate_response(messages: List[dict], model: str, temperature: float, stream: bool,
                             max_tokens: Optional[int] = None, presence_penalty: float = 0,
                             frequency_penalty: float = 0, top_p: float = 1.0) -> AsyncGenerator[str, None]:
-    """Enhanced response generation with context support"""
-    # Ensure session is initialized
+    """Generate response with improved performance"""
     await session_manager.refresh_if_needed()
-    
-    # Get messages with context
-    context_messages = session_manager.get_context_messages(messages)
-    current_query = messages[-1]['content']
-    
-    # Add current user message to history
-    session_manager.add_to_history("user", current_query)
 
     timestamp = generate_timestamp()
     payload = {
         'userId': session_manager.user_id,
         'botId': Config.BOT_ID,
         'botAlias': 'custom',
-        'query': current_query,
+        'query': messages[-1]['content'],
         'isRetry': False,
         'breakingStrategy': 0,
-        'isNewConversation': len(session_manager.conversation_history) <= 1,  # Dynamic conversation state
+        'isNewConversation': True,
         'mediaInfos': [],
-        'turnIndex': len(session_manager.conversation_history) - 1,
+        'turnIndex': 0,
         'rewriteQuery': '',
         'conversationId': session_manager.conversation_id,
         'capabilities': [{
@@ -568,72 +492,119 @@ async def generate_response(messages: List[dict], model: str, temperature: float
         'x-yuanshi-appversionname': '3.1.0',
     })
 
-    assistant_response = ""
-    
+    client = await session_manager.get_client()
     try:
-        # Use reduced timeout for faster response
-        async with httpx.AsyncClient(timeout=httpx.Timeout(60)) as client:
-            async with client.stream('POST', f"{Config.BASE_URL}/core/conversation/chat/v1",
-                                     headers=headers, content=data) as response:
-                response.raise_for_status()
+        async with client.stream('POST', f"{Config.BASE_URL}/core/conversation/chat/v1",
+                                 headers=headers, content=data) as response:
+            response.raise_for_status()
 
-                is_first_chunk = True
-                current_event = None
-                in_thinking_block = False
-                thinking_content = []
-                thinking_started = False
+            is_first_chunk = True
+            current_event = None
+            in_thinking_block = False
+            thinking_content = []
+            thinking_started = False
 
-                async for line in response.aiter_lines():
-                    line = line.strip()
-                    if not line:
-                        current_event = None
+            async for line in response.aiter_lines():
+                line = line.strip()
+                if not line:
+                    current_event = None
+                    continue
+
+                if line.startswith("event:"):
+                    current_event = line[len("event:"):].strip()
+                    continue
+
+                elif line.startswith("data:"):
+                    json_str = line[len("data:"):].strip()
+                    try:
+                        data = json.loads(json_str)
+
+                        if current_event == "message":
+                            result, in_thinking_block, thinking_started, is_first_chunk, thinking_content = await process_message_event(
+                                data, is_first_chunk, in_thinking_block, thinking_started, thinking_content
+                            )
+                            if result:
+                                yield result
+
+                        elif current_event == "generateEnd":
+                            # Process end event
+                            timestamp = data.get("timestamp", "")
+                            created = int(timestamp) // 1000 if timestamp else int(time.time())
+                            sse_id = data.get('sseId', str(uuid.uuid4()))
+
+                            if in_thinking_block:
+                                end_thinking_chunk = create_chunk(sse_id=sse_id, created=created, content="\n<Thinking>
+</Thinking>\n\n")
+                                yield f"data: {json.dumps(end_thinking_chunk, ensure_ascii=False)}\n\n"
+
+                            meta_chunk = create_chunk(sse_id=sse_id, created=created, 
+                                                    meta={"thinking_content": "".join(thinking_content) if thinking_content else None})
+                            yield f"data: {json.dumps(meta_chunk, ensure_ascii=False)}\n\n"
+
+                            end_chunk = create_chunk(sse_id=sse_id, created=created, finish_reason="stop")
+                            yield f"data: {json.dumps(end_chunk, ensure_ascii=False)}\n\n"
+                            yield "data: [DONE]\n\n"
+
+                    except json.JSONDecodeError as e:
+                        logger.error(f"JSON parse error: {e}")
                         continue
-
-                    if line.startswith("event:"):
-                        current_event = line[len("event:"):].strip()
-                        continue
-
-                    elif line.startswith("data:"):
-                        json_str = line[len("data:"):].strip()
-                        try:
-                            data = json.loads(json_str)
-
-                            if current_event == "message":
-                                result, in_thinking_block, thinking_started, is_first_chunk, thinking_content = await process_message_event(
-                                    data, is_first_chunk, in_thinking_block, thinking_started, thinking_content
-                                )
-                                if result:
-                                    # Collect assistant response for history
-                                    if not in_thinking_block and "content" in data:
-                                        content = remove_reference_annotations(clean_thinking_content(data.get("content", "")))
-                                        if content:
-                                            assistant_response += content
-                                    yield result
-
-                            elif current_event == "generateEnd":
-                                # Add assistant response to history
-                                if assistant_response.strip():
-                                    session_manager.add_to_history("assistant", assistant_response.strip())
-                                
-                                for chunk in process_generate_end_event(data, in_thinking_block, thinking_content):
-                                    yield chunk
-
-                        except json.JSONDecodeError as e:
-                            logger.error(f"JSON parse error: {e}")
-                            continue
 
     except httpx.RequestError as e:
         logger.error(f"Generate response error: {e}")
         try:
-            session_manager.initialize()
+            await session_manager.initialize()
             logger.info("Session reinitialized")
         except Exception as re_init_error:
             logger.error(f"Failed to reinitialize session: {re_init_error}")
         raise HTTPException(status_code=500, detail=f"Request error: {str(e)}")
 
+# Lifespan context manager for proper startup/shutdown
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    try:
+        await session_manager.initialize()
+        memory_manager.start_monitoring()
+        logger.info("Application started with enhanced memory monitoring")
+    except Exception as e:
+        logger.error(f"Startup initialization error: {e}")
+        raise
+    
+    yield
+    
+    # Shutdown
+    try:
+        memory_manager.is_running = False
+        await session_manager.close_client()
+        logger.info("Application shutdown complete")
+    except Exception as e:
+        logger.error(f"Shutdown error: {e}")
+
+# Create FastAPI instance with lifespan
+app = FastAPI(lifespan=lifespan)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Helper function for API key verification
+async def verify_api_key(authorization: str = Header(None)):
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Missing API key")
+    api_key = authorization.replace("Bearer ", "").strip()
+    if api_key != Config.API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    return api_key
+
+# API endpoints
 @app.get("/")
-async def home():
-    return {"status": "ok", "message": "Enhanced AI Chat Proxy Server is running!"}
+async def root():
+    return {"status": "ok", "message": "Enhanced AI API Proxy is running!"}
 
 @app.get("/v1/models")
 async def list_models():
@@ -664,12 +635,17 @@ async def list_models():
     return {"object": "list", "data": models_data}
 
 @app.post("/v1/chat/completions")
-async def chat_completions(request: ChatCompletionRequest, authorization: str = Header(None)):
-    """Enhanced chat completion with context support"""
+async def chat_completions(request: ChatCompletionRequest, authorization: str = Header(None), 
+                          background_tasks: BackgroundTasks = None):
+    """Process chat completion requests with enhanced performance"""
     await verify_api_key(authorization)
     
-    logger.info(f"Chat request: model={request.model}, stream={request.stream}, messages={len(request.messages)}")
+    logger.info(f"Chat request: model={request.model}, stream={request.stream}")
     messages = [msg.model_dump() for msg in request.messages]
+
+    # Schedule cleanup in background if needed
+    if background_tasks:
+        background_tasks.add_task(memory_manager.cleanup_memory)
 
     if not request.stream:
         # Non-streaming response
@@ -697,10 +673,12 @@ async def chat_completions(request: ChatCompletionRequest, authorization: str = 
                             elif content_part == "\n</Thinking>\n\n":
                                 in_thinking = False
                                 continue
+                            
                             if in_thinking:
                                 thinking_content += content_part
                             else:
                                 content += content_part
+                        
                         if "meta" in delta:
                             meta = delta["meta"]
             except Exception as e:
@@ -737,7 +715,7 @@ async def chat_completions(request: ChatCompletionRequest, authorization: str = 
 
 @app.get("/memory")
 async def memory_status():
-    """Enhanced memory status endpoint"""
+    """Get detailed memory status"""
     try:
         import resource
         usage = resource.getrusage(resource.RUSAGE_SELF)
@@ -764,21 +742,20 @@ async def memory_status():
             "available_memory_mb": round(free_mem, 2) if free_mem > 0 else "unknown",
             "memory_percent": round(percent, 2) if percent > 0 else "unknown",
             "gc_objects": len(gc.get_objects()),
-            "conversation_history_size": len(session_manager.conversation_history),
-            "cache_size": len(session_manager._cache),
+            "auto_cleanup_enabled": memory_manager.is_running,
             "last_cleanup": memory_manager.last_cleanup,
-            "monitoring_active": memory_manager.is_running
+            "cleanup_interval": memory_manager.auto_cleanup_interval
         }
     except ImportError:
         return {
             "gc_objects": len(gc.get_objects()),
-            "conversation_history_size": len(session_manager.conversation_history),
+            "auto_cleanup_enabled": memory_manager.is_running,
             "note": "Limited memory information available"
         }
 
 @app.post("/memory/cleanup")
 async def trigger_cleanup():
-    """Enhanced manual memory cleanup"""
+    """Manually trigger memory cleanup"""
     try:
         import resource
         usage_before = resource.getrusage(resource.RUSAGE_SELF)
@@ -790,14 +767,7 @@ async def trigger_cleanup():
         mem_before = 0
     
     obj_count_before = len(gc.get_objects())
-    history_before = len(session_manager.conversation_history)
-    
-    # Enhanced cleanup
     memory_manager.cleanup_memory()
-    
-    # Clean old conversation history
-    if len(session_manager.conversation_history) > session_manager.max_history:
-        session_manager.conversation_history = session_manager.conversation_history[-session_manager.max_history:]
     
     try:
         import resource
@@ -812,55 +782,21 @@ async def trigger_cleanup():
         mem_diff = 0
     
     obj_count_after = len(gc.get_objects())
-    history_after = len(session_manager.conversation_history)
+    obj_diff = obj_count_before - obj_count_after
     
     return {
         "status": "success",
         "memory_before_mb": round(mem_before, 2) if mem_before > 0 else "unknown",
         "memory_after_mb": round(mem_after, 2) if mem_after > 0 else "unknown",
-        "memory_difference_mb": round(mem_diff, 2) if mem_diff != 0 else "unknown",
+        "memory_freed_mb": round(mem_diff, 2) if mem_diff != 0 else "unknown",
         "objects_before": obj_count_before,
         "objects_after": obj_count_after,
-        "objects_difference": obj_count_before - obj_count_after,
-        "history_before": history_before,
-        "history_after": history_after,
-        "history_cleaned": history_before - history_after
+        "objects_freed": obj_diff
     }
-
-@app.get("/conversation/history")
-async def get_conversation_history():
-    """Get current conversation history"""
-    return {
-        "history": session_manager.conversation_history,
-        "total_messages": len(session_manager.conversation_history),
-        "max_history": session_manager.max_history
-    }
-
-@app.delete("/conversation/history")
-async def clear_conversation_history():
-    """Clear conversation history"""
-    old_count = len(session_manager.conversation_history)
-    session_manager.conversation_history.clear()
-    return {
-        "status": "success",
-        "cleared_messages": old_count,
-        "remaining_messages": len(session_manager.conversation_history)
-    }
-
-@app.on_event("startup")
-async def startup_event():
-    """Enhanced startup initialization"""
-    try:
-        session_manager.initialize()
-        memory_manager.start_monitoring()
-        logger.info("Enhanced application started with memory monitoring and context support")
-    except Exception as e:
-        logger.error(f"Startup initialization error: {e}")
-        raise
 
 @app.get("/health")
 async def health_check():
-    """Enhanced health check"""
+    """Enhanced health check endpoint"""
     try:
         import resource
         usage = resource.getrusage(resource.RUSAGE_SELF)
@@ -881,24 +817,24 @@ async def health_check():
         
         status = "ok"
         if percent > 90:
-            status = "warning"
+            status = "critical"
             memory_manager.cleanup_memory()
+        elif percent > 75:
+            status = "warning"
     except ImportError:
         status = "ok"
         percent = 0
         mem_used = 0
     
+    session_status = "active" if session_manager.is_initialized() else "inactive"
+    
     return {
         "status": status,
-        "session": "active" if session_manager.is_initialized() else "inactive",
+        "session": session_status,
         "memory": {
             "percent": round(percent, 2) if percent > 0 else "unknown",
             "used_mb": round(mem_used, 2) if mem_used > 0 else "unknown"
         },
-        "features": {
-            "context_support": True,
-            "reference_cleaning": True,
-            "auto_memory_cleanup": memory_manager.is_running,
-            "conversation_history": len(session_manager.conversation_history)
-        }
+        "auto_cleanup": memory_manager.is_running,
+        "uptime": int(time.time() - memory_manager.last_cleanup)
     }
