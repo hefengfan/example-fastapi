@@ -411,27 +411,27 @@ async def process_message_event(data: dict, is_first_chunk: bool, in_thinking_bl
     result = ""
 
     # Check if it's the start of a thinking block
-    if "\`\`\`ys_think" in content and not thinking_started:
+    if "```ys_think" in content and not thinking_started:
         thinking_started = True
         in_thinking_block = True
-        # Send thinking block start marker
+        # 发送思考块开始标记
         chunk = create_chunk(
             sse_id=sse_id,
             created=created,
-            content="<Thinking>\n\n",
+            content="<think>\n\n",
             is_first=is_first_chunk
         )
         result = f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
         return result, in_thinking_block, thinking_started, is_first_chunk, thinking_content
 
     # Check if it's the end of a thinking block
-    if "\`\`\`" in content and in_thinking_block:
+    if "```" in content and in_thinking_block:
         in_thinking_block = False
-        # Send thinking block end marker
+        # 发送思考块结束标记
         chunk = create_chunk(
             sse_id=sse_id,
             created=created,
-            content="\n</Thinking>\n\n"
+            content="\n</think>\n\n"
         )
         result = f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
         return result, in_thinking_block, thinking_started, is_first_chunk, thinking_content
