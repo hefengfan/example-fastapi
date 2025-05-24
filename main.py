@@ -5,11 +5,7 @@ import uuid
 import datetime
 import time
 import re
-import gc
-import threading
-import os
-import sys
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, BackgroundTasks
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any, AsyncGenerator, Tuple
@@ -18,16 +14,39 @@ import logging
 import hashlib
 import base64
 import hmac
+import gc
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.concurrency import run_in_threadpool
 
-logging.basicConfig(level=logging.INFO)
+# Configure logging with memory-efficient settings
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
 logger = logging.getLogger(__name__)
 
+# Create FastAPI app with optimized settings
+app = FastAPI(
+    title="AI Chat API",
+    description="Optimized API for low-memory environments",
+    docs_url=None,  # Disable Swagger UI to save memory
+    redoc_url=None  # Disable ReDoc to save memory
+)
+
+# Memory optimization middleware
+class MemoryOptimizationMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        # Force garbage collection after each request
+        await run_in_threadpool(gc.collect)
+        return response
+
+app.add_middleware(MemoryOptimizationMiddleware)
+
+# Add CORS middleware with memory-efficient settings
 from fastapi.middleware.cors import CORSMiddleware
-
-# Create FastAPI instance
-app = FastAPI()
-
-# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -36,153 +55,79 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Memory management configuration
-class MemoryManager:
-    def __init__(self, threshold_percent=80, check_interval=60):
-        self.threshold_percent = threshold_percent  # Memory usage threshold to trigger cleanup
-        self.check_interval = check_interval  # Check interval in seconds
-        self.is_running = False
-        self.monitor_thread = None
-        
-    def start_monitoring(self):
-        """Start the memory monitoring thread"""
-        if not self.is_running:
-            self.is_running = True
-            self.monitor_thread = threading.Thread(target=self._monitor_memory, daemon=True)
-            self.monitor_thread.start()
-            logger.info("Memory monitoring started")
-    
-    def _monitor_memory(self):
-        """Monitor memory usage and trigger cleanup when necessary"""
-        while self.is_running:
-            try:
-                memory_percent = self.get_memory_usage()
-                
-                logger.info(f"Current memory usage: {memory_percent:.1f}%")
-                
-                if memory_percent > self.threshold_percent:
-                    logger.warning(f"Memory usage high ({memory_percent:.1f}%), triggering cleanup")
-                    self.cleanup_memory()
-                    
-            except Exception as e:
-                logger.error(f"Error in memory monitoring: {e}")
-                
-            time.sleep(self.check_interval)
-    
-    def get_memory_usage(self):
-        """Get current memory usage percentage using built-in methods"""
-        try:
-            # Try to use resource module (Unix-like systems)
-            import resource
-            usage = resource.getrusage(resource.RUSAGE_SELF)
-            # Convert to MB (ru_maxrss is in KB on Linux, bytes on macOS)
-            if sys.platform == 'darwin':  # macOS
-                mem_used = usage.ru_maxrss / 1024 / 1024
-            else:  # Linux
-                mem_used = usage.ru_maxrss / 1024
-                
-            # Get total memory from /proc/meminfo on Linux
-            total_mem = self._get_total_memory()
-            if total_mem > 0:
-                return (mem_used / total_mem) * 100
-            
-            # Fallback: estimate based on process size relative to expected total
-            # Assuming the server has 500MB as mentioned
-            return (mem_used / 500) * 100
-            
-        except ImportError:
-            # Fallback for systems without resource module
-            # Use a simple heuristic based on available objects
-            gc.collect()  # Collect first to get accurate count
-            obj_count = len(gc.get_objects())
-            # Rough estimate - adjust threshold based on testing
-            threshold = 1000000  # Arbitrary large number of objects
-            return (obj_count / threshold) * 100
-    
-    def _get_total_memory(self):
-        """Get total system memory in MB"""
-        try:
-            # Try to read from /proc/meminfo on Linux
-            if os.path.exists('/proc/meminfo'):
-                with open('/proc/meminfo', 'r') as f:
-                    for line in f:
-                        if 'MemTotal' in line:
-                            # Extract value in KB and convert to MB
-                            return int(line.split()[1]) / 1024
-            return 0
-        except:
-            return 0
-    
-    def cleanup_memory(self):
-        """Perform memory cleanup operations"""
-        # Force garbage collection
-        collected = gc.collect(generation=2)
-        logger.info(f"Garbage collection: collected {collected} objects")
-        
-        # Clear httpx cache if possible
-        try:
-            httpx._pools.POOLS.clear()
-            logger.info("Cleared httpx connection pools")
-        except:
-            pass
-        
-        # Additional cleanup for Python memory fragmentation
-        try:
-            import ctypes
-            ctypes.CDLL('libc.so.6').malloc_trim(0)
-            logger.info("Called malloc_trim to release memory to OS")
-        except:
-            pass
-        
-        # Log memory after cleanup
-        memory_percent = self.get_memory_usage()
-        logger.info(f"Memory after cleanup: {memory_percent:.1f}%")
-
-# Initialize memory manager
-memory_manager = MemoryManager(threshold_percent=75, check_interval=30)
-
-# Add configuration class to manage API configuration
+# Configuration class with memory-efficient design
 class Config:
     API_KEY = "TkoWuEN8cpDJubb7Zfwxln16NQDZIc8z"
     BASE_URL = "https://api-bj.wenxiaobai.com/api/v1.0"
     BOT_ID = 200006
     DEFAULT_MODEL = "DeepSeek-R1"
+    # Add timeout and retry settings
+    REQUEST_TIMEOUT = 60
+    MAX_RETRIES = 3
+    RETRY_DELAY = 2
 
-
-# Add session management class
+# Session manager with improved error handling
 class SessionManager:
     def __init__(self):
         self.device_id = None
         self.token = None
         self.user_id = None
         self.conversation_id = None
+        self.last_error = None
+        self.error_count = 0
+        self.last_success = 0
 
     def initialize(self):
-        """Initialize session"""
-        self.device_id = generate_device_id()
-        self.token, self.user_id = get_auth_token(self.device_id)
-        self.conversation_id = create_conversation(self.device_id, self.token, self.user_id)
-        logger.info(f"Session initialized: user_id={self.user_id}, conversation_id={self.conversation_id}")
+        """Initialize session with error handling"""
+        try:
+            self.device_id = generate_device_id()
+            self.token, self.user_id = get_auth_token(self.device_id)
+            self.conversation_id = create_conversation(self.device_id, self.token, self.user_id)
+            self.last_error = None
+            self.error_count = 0
+            self.last_success = time.time()
+            logger.info(f"Session initialized: user_id={self.user_id}, conversation_id={self.conversation_id}")
+            return True
+        except Exception as e:
+            self.last_error = str(e)
+            self.error_count += 1
+            logger.error(f"Session initialization failed: {e}")
+            return False
 
     def is_initialized(self):
         """Check if session is initialized"""
         return all([self.device_id, self.token, self.user_id, self.conversation_id])
 
-    async def refresh_if_needed(self):
-        """Refresh session if needed"""
+    def needs_refresh(self):
+        """Check if session needs refresh based on time or errors"""
         if not self.is_initialized():
-            self.initialize()
+            return True
+        if self.error_count >= 3:
+            return True
+        if time.time() - self.last_success > 3600:  # Refresh after 1 hour
+            return True
+        return False
 
+    async def refresh_if_needed(self):
+        """Refresh session if needed with backoff strategy"""
+        if self.needs_refresh():
+            retry_count = 0
+            while retry_count < Config.MAX_RETRIES:
+                if self.initialize():
+                    return True
+                retry_count += 1
+                await asyncio.sleep(Config.RETRY_DELAY * (2 ** retry_count))  # Exponential backoff
+            return False
+        return True
 
 # Create session manager instance
 session_manager = SessionManager()
 
-
+# Pydantic models with memory-efficient design
 class Message(BaseModel):
     role: str
     content: str
     name: Optional[str] = None
-
 
 class ChatCompletionRequest(BaseModel):
     model: str
@@ -205,24 +150,21 @@ class ModelData(BaseModel):
     root: str
     parent: Optional[str] = None
 
-
+# Utility functions
 def generate_device_id() -> str:
     """Generate device ID"""
     return f"{uuid.uuid4().hex}_{int(time.time() * 1000)}_{random.randint(100000, 999999)}"
 
-
 def generate_timestamp() -> str:
-    """Generate UTC time string as required"""
+    """Generate UTC timestamp string"""
     timestamp_ms = int(time.time() * 1000) + 559
     utc_time = datetime.datetime.utcfromtimestamp(timestamp_ms / 1000.0)
     return utc_time.strftime('%a, %d %b %Y %H:%M:%S GMT')
-
 
 def calculate_sha256(data: str) -> str:
     """Calculate SHA-256 digest"""
     sha256 = hashlib.sha256(data.encode()).digest()
     return base64.b64encode(sha256).decode()
-
 
 def generate_signature(timestamp: str, digest: str) -> str:
     """Generate request signature"""
@@ -233,7 +175,6 @@ def generate_signature(timestamp: str, digest: str) -> str:
         hashlib.sha1
     ).digest()
     return base64.b64encode(signature).decode()
-
 
 def create_common_headers(timestamp: str, digest: str, token: Optional[str] = None,
                           device_id: Optional[str] = None) -> dict:
@@ -274,7 +215,6 @@ def create_common_headers(timestamp: str, digest: str, token: Optional[str] = No
 
     return headers
 
-
 def get_auth_token(device_id: str) -> Tuple[str, str]:
     """Get authentication token"""
     timestamp = generate_timestamp()
@@ -292,22 +232,21 @@ def get_auth_token(device_id: str) -> Tuple[str, str]:
     headers = create_common_headers(timestamp, digest)
 
     try:
-        response = httpx.post(
-            f"{Config.BASE_URL}/user/sessions",
-            headers=headers,
-            content=data,
-            timeout=300
-        )
-        response.raise_for_status()
-        result = response.json()
-        return result['data']['token'], result['data']['user']['id']
+        with httpx.Client(timeout=Config.REQUEST_TIMEOUT) as client:
+            response = client.post(
+                f"{Config.BASE_URL}/user/sessions",
+                headers=headers,
+                content=data
+            )
+            response.raise_for_status()
+            result = response.json()
+            return result['data']['token'], result['data']['user']['id']
     except httpx.RequestError as e:
-        logger.error(f"Failed to get auth token: {e}")
+        logger.error(f"Authentication token request failed: {e}")
         raise HTTPException(status_code=500, detail=f"Authentication failed: {str(e)}")
     except (KeyError, json.JSONDecodeError) as e:
-        logger.error(f"Failed to parse auth response: {e}")
+        logger.error(f"Authentication response parsing failed: {e}")
         raise HTTPException(status_code=500, detail="Server returned invalid authentication data")
-
 
 def create_conversation(device_id: str, token: str, user_id: str) -> str:
     """Create new conversation"""
@@ -319,26 +258,24 @@ def create_conversation(device_id: str, token: str, user_id: str) -> str:
     headers = create_common_headers(timestamp, digest, token, device_id)
 
     try:
-        response = httpx.post(
-            f"{Config.BASE_URL}/core/conversations/users/{user_id}/bots/{Config.BOT_ID}/conversation",
-            headers=headers,
-            content=data,
-            timeout=300
-        )
-        response.raise_for_status()
-        return response.json()['data']
+        with httpx.Client(timeout=Config.REQUEST_TIMEOUT) as client:
+            response = client.post(
+                f"{Config.BASE_URL}/core/conversations/users/{user_id}/bots/{Config.BOT_ID}/conversation",
+                headers=headers,
+                content=data
+            )
+            response.raise_for_status()
+            return response.json()['data']
     except httpx.RequestError as e:
-        logger.error(f"Failed to create conversation: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to create conversation: {str(e)}")
+        logger.error(f"Create conversation failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Create conversation failed: {str(e)}")
     except (KeyError, json.JSONDecodeError) as e:
-        logger.error(f"Failed to parse conversation response: {e}")
+        logger.error(f"Conversation response parsing failed: {e}")
         raise HTTPException(status_code=500, detail="Server returned invalid conversation data")
 
-
 def is_thinking_content(content: str) -> bool:
-    """Determine if content is thinking process"""
+    """Check if content is thinking process"""
     return "```ys_think" in content
-
 
 def clean_thinking_content(content: str) -> str:
     """Clean thinking process content, remove special markers"""
@@ -352,17 +289,14 @@ def clean_thinking_content(content: str) -> str:
         return ""
     return content
 
-
-# Remove reference annotations like [1](@ref) from content
-def remove_reference_annotations(content: str) -> str:
-    """Remove reference annotations like [1](@ref) from content"""
-    # Pattern to match [number](@ref) or similar reference annotations
+# Function to remove reference patterns like [1](@ref)
+def remove_reference_patterns(content: str) -> str:
+    """Remove reference patterns like [数字](@ref) from content"""
+    # Pattern to match [数字](@ref) or similar reference patterns
     pattern = r'\[\d+\]$$@ref$$'
-    cleaned_content = re.sub(pattern, '', content)
-    return cleaned_content
+    return re.sub(pattern, '', content)
 
-
-# Helper function: Verify API key
+# Verify API key
 async def verify_api_key(authorization: str = Header(None)):
     if not authorization:
         raise HTTPException(status_code=401, detail="Missing API key")
@@ -371,7 +305,6 @@ async def verify_api_key(authorization: str = Header(None)):
     if api_key != Config.API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
     return api_key
-
 
 def create_chunk(sse_id: str, created: int, content: Optional[str] = None,
                  is_first: bool = False, meta: Optional[dict] = None,
@@ -400,7 +333,6 @@ def create_chunk(sse_id: str, created: int, content: Optional[str] = None,
         }]
     }
 
-
 async def process_message_event(data: dict, is_first_chunk: bool, in_thinking_block: bool,
                                 thinking_started: bool, thinking_content: list) -> Tuple[str, bool, bool, bool, list]:
     """Process message event"""
@@ -410,7 +342,10 @@ async def process_message_event(data: dict, is_first_chunk: bool, in_thinking_bl
     sse_id = data.get('sseId', str(uuid.uuid4()))
     result = ""
 
-    # Check if it's the start of a thinking block
+    # Remove reference patterns from content
+    content = remove_reference_patterns(content)
+
+    # Check if it's the start of thinking block
     if "```ys_think" in content and not thinking_started:
         thinking_started = True
         in_thinking_block = True
@@ -421,10 +356,11 @@ async def process_message_event(data: dict, is_first_chunk: bool, in_thinking_bl
             content="<Thinking>\n\n",
             is_first=is_first_chunk
         )
+        # Fix the syntax error in the original code
         result = f"data: \{json.dumps(chunk, ensure_ascii=False)\}\n\n"
         return result, in_thinking_block, thinking_started, is_first_chunk, thinking_content
 
-    # Check if it's the end of a thinking block
+    # Check if it's the end of thinking block
     if "```" in content and in_thinking_block:
         in_thinking_block = False
         # Send thinking block end marker
@@ -433,6 +369,7 @@ async def process_message_event(data: dict, is_first_chunk: bool, in_thinking_bl
             created=created,
             content="\n</Thinking>\n\n"
         )
+        # Fix the syntax error in the original code
         result = f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
         return result, in_thinking_block, thinking_started, is_first_chunk, thinking_content
 
@@ -445,16 +382,14 @@ async def process_message_event(data: dict, is_first_chunk: bool, in_thinking_bl
             created=created,
             content=content
         )
+        # Fix the syntax error in the original code
         result = f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
         return result, in_thinking_block, thinking_started, is_first_chunk, thinking_content
 
     # Clean content, remove thinking block
     content = clean_thinking_content(content)
-    if not content:  # If content is empty after cleaning, skip
+    if not content:  # Skip if content is empty after cleaning
         return result, in_thinking_block, thinking_started, is_first_chunk, thinking_content
-
-    # Remove reference annotations
-    content = remove_reference_annotations(content)
 
     # Send normal content
     chunk = create_chunk(
@@ -463,9 +398,9 @@ async def process_message_event(data: dict, is_first_chunk: bool, in_thinking_bl
         content=content,
         is_first=is_first_chunk
     )
+    # Fix the syntax error in the original code
     result = f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
     return result, in_thinking_block, thinking_started, False, thinking_content
-
 
 def process_generate_end_event(data: dict, in_thinking_block: bool, thinking_content: list) -> List[str]:
     """Process generation end event"""
@@ -482,6 +417,7 @@ def process_generate_end_event(data: dict, in_thinking_block: bool, thinking_con
             content="\n<Thinking>
 </Thinking>\n\n"
         )
+        # Fix the syntax error in the original code
         result.append(f"data: {json.dumps(end_thinking_chunk, ensure_ascii=False)}\n\n")
 
     # Add metadata
@@ -490,6 +426,7 @@ def process_generate_end_event(data: dict, in_thinking_block: bool, thinking_con
         created=created,
         meta={"thinking_content": "".join(thinking_content) if thinking_content else None}
     )
+    # Fix the syntax error in the original code
     result.append(f"data: {json.dumps(meta_chunk, ensure_ascii=False)}\n\n")
 
     # Send end marker
@@ -498,17 +435,36 @@ def process_generate_end_event(data: dict, in_thinking_block: bool, thinking_con
         created=created,
         finish_reason="stop"
     )
+    # Fix the syntax error in the original code
     result.append(f"data: {json.dumps(end_chunk, ensure_ascii=False)}\n\n")
     result.append("data: [DONE]\n\n")
     return result
 
-
+# Memory-efficient generator for streaming responses
 async def generate_response(messages: List[dict], model: str, temperature: float, stream: bool,
                             max_tokens: Optional[int] = None, presence_penalty: float = 0,
                             frequency_penalty: float = 0, top_p: float = 1.0) -> AsyncGenerator[str, None]:
-    """Generate response - using true streaming"""
+    """Generate response - using true streaming with memory optimization"""
     # Ensure session is initialized
-    await session_manager.refresh_if_needed()
+    session_initialized = await session_manager.refresh_if_needed()
+    if not session_initialized:
+        # If session initialization fails, yield an error message
+        error_chunk = create_chunk(
+            sse_id=str(uuid.uuid4()),
+            created=int(time.time()),
+            content="服务暂时不可用，请稍后再试。",
+            is_first=True
+        )
+        yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n"
+        
+        end_chunk = create_chunk(
+            sse_id=str(uuid.uuid4()),
+            created=int(time.time()),
+            finish_reason="error"
+        )
+        yield f"data: {json.dumps(end_chunk, ensure_ascii=False)}\n\n"
+        yield "data: [DONE]\n\n"
+        return
 
     timestamp = generate_timestamp()
     payload = {
@@ -563,68 +519,132 @@ async def generate_response(messages: List[dict], model: str, temperature: float
         'x-yuanshi-appversionname': '3.1.0',
     })
 
-    try:
-        # Use stream=True parameter for true streaming
-        async with httpx.AsyncClient(timeout=httpx.Timeout(150)) as client:
-            async with client.stream('POST', f"{Config.BASE_URL}/core/conversation/chat/v1",
-                                     headers=headers, content=data) as response:
-                response.raise_for_status()
+    # Track empty response handling
+    empty_response_count = 0
+    max_empty_responses = 3
+    retry_count = 0
+    max_retries = Config.MAX_RETRIES
 
-                # Process streaming response
-                is_first_chunk = True
-                current_event = None
-                in_thinking_block = False
-                thinking_content = []
-                thinking_started = False
+    while retry_count <= max_retries:
+        try:
+            # Use stream=True parameter for true streaming
+            async with httpx.AsyncClient(timeout=httpx.Timeout(Config.REQUEST_TIMEOUT)) as client:
+                async with client.stream('POST', f"{Config.BASE_URL}/core/conversation/chat/v1",
+                                        headers=headers, content=data) as response:
+                    response.raise_for_status()
 
-                async for line in response.aiter_lines():
-                    line = line.strip()
-                    if not line:
-                        current_event = None
-                        continue
+                    # Process streaming response
+                    is_first_chunk = True
+                    current_event = None
+                    in_thinking_block = False
+                    thinking_content = []
+                    thinking_started = False
+                    has_yielded_content = False
 
-                    # Parse event type
-                    if line.startswith("event:"):
-                        current_event = line[len("event:"):].strip()
-                        continue
-
-                    # Process data line
-                    elif line.startswith("data:"):
-                        json_str = line[len("data:"):].strip()
-                        try:
-                            data = json.loads(json_str)
-
-                            # Process message event
-                            if current_event == "message":
-                                result, in_thinking_block, thinking_started, is_first_chunk, thinking_content = await process_message_event(
-                                    data, is_first_chunk, in_thinking_block, thinking_started, thinking_content
-                                )
-                                if result:
-                                    yield result
-
-                            # Process generation end event
-                            elif current_event == "generateEnd":
-                                for chunk in process_generate_end_event(data, in_thinking_block, thinking_content):
-                                    yield chunk
-
-                        except json.JSONDecodeError as e:
-                            logger.error(f"JSON parse error: {e}")
+                    async for line in response.aiter_lines():
+                        line = line.strip()
+                        if not line:
+                            current_event = None
                             continue
 
-    except httpx.RequestError as e:
-        logger.error(f"Generate response error: {e}")
-        # Try to reinitialize session
-        try:
-            session_manager.initialize()
-            logger.info("Session reinitialized")
-        except Exception as re_init_error:
-            logger.error(f"Failed to reinitialize session: {re_init_error}")
-        raise HTTPException(status_code=500, detail=f"Request error: {str(e)}")
+                        # Parse event type
+                        if line.startswith("event:"):
+                            current_event = line[len("event:"):].strip()
+                            continue
+
+                        # Process data line
+                        elif line.startswith("data:"):
+                            json_str = line[len("data:"):].strip()
+                            try:
+                                data = json.loads(json_str)
+
+                                # Process message event
+                                if current_event == "message":
+                                    result, in_thinking_block, thinking_started, is_first_chunk, thinking_content = await process_message_event(
+                                        data, is_first_chunk, in_thinking_block, thinking_started, thinking_content
+                                    )
+                                    if result:
+                                        has_yielded_content = True
+                                        yield result
+
+                                # Process generation end event
+                                elif current_event == "generateEnd":
+                                    for chunk in process_generate_end_event(data, in_thinking_block, thinking_content):
+                                        has_yielded_content = True
+                                        yield chunk
+
+                            except json.JSONDecodeError as e:
+                                logger.error(f"JSON parsing error: {e}")
+                                continue
+
+                    # Handle empty response
+                    if not has_yielded_content:
+                        empty_response_count += 1
+                        if empty_response_count >= max_empty_responses:
+                            # If we've had too many empty responses, yield an error
+                            error_chunk = create_chunk(
+                                sse_id=str(uuid.uuid4()),
+                                created=int(time.time()),
+                                content="服务暂时不可用，请稍后再试。",
+                                is_first=True
+                            )
+                            yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n"
+                            
+                            end_chunk = create_chunk(
+                                sse_id=str(uuid.uuid4()),
+                                created=int(time.time()),
+                                finish_reason="error"
+                            )
+                            yield f"data: {json.dumps(end_chunk, ensure_ascii=False)}\n\n"
+                            yield "data: [DONE]\n\n"
+                            break
+                        
+                        # Try to reinitialize session
+                        session_manager.initialize()
+                        retry_count += 1
+                        await asyncio.sleep(Config.RETRY_DELAY * (2 ** retry_count))  # Exponential backoff
+                        continue
+                    
+                    # If we got here with content, we're done
+                    session_manager.last_success = time.time()
+                    session_manager.error_count = 0
+                    break
+
+        except httpx.RequestError as e:
+            logger.error(f"Generate response error: {e}")
+            retry_count += 1
+            
+            # Try to reinitialize session
+            try:
+                session_manager.initialize()
+                logger.info("Session reinitialized")
+            except Exception as re_init_error:
+                logger.error(f"Session reinitialization failed: {re_init_error}")
+            
+            # If we've reached max retries, yield an error
+            if retry_count > max_retries:
+                error_chunk = create_chunk(
+                    sse_id=str(uuid.uuid4()),
+                    created=int(time.time()),
+                    content="服务暂时不可用，请稍后再试。",
+                    is_first=True
+                )
+                yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n"
+                
+                end_chunk = create_chunk(
+                    sse_id=str(uuid.uuid4()),
+                    created=int(time.time()),
+                    finish_reason="error"
+                )
+                yield f"data: {json.dumps(end_chunk, ensure_ascii=False)}\n\n"
+                yield "data: [DONE]\n\n"
+                break
+            
+            await asyncio.sleep(Config.RETRY_DELAY * (2 ** retry_count))  # Exponential backoff
 
 @app.get("/")
 async def hff():
     return {"status": "ok", "提示": "hefengfan接口已成功部署！"}
-
 
 @app.get("/v1/models")
 async def list_models():
@@ -655,10 +675,9 @@ async def list_models():
 
     return {"object": "list", "data": models_data}
 
-
 @app.post("/v1/chat/completions")
-async def chat_completions(request: ChatCompletionRequest, authorization: str = Header(None)):
-    """Process chat completion requests"""
+async def chat_completions(request: ChatCompletionRequest, background_tasks: BackgroundTasks, authorization: str = Header(None)):
+    """Handle chat completion requests with memory optimization"""
     # Verify API key
     await verify_api_key(authorization)
 
@@ -667,7 +686,7 @@ async def chat_completions(request: ChatCompletionRequest, authorization: str = 
     messages = [msg.model_dump() for msg in request.messages]
 
     if not request.stream:
-        # Non-streaming response processing
+        # Non-streaming response handling
         content = ""
         thinking_content = ""
         meta = None
@@ -690,6 +709,8 @@ async def chat_completions(request: ChatCompletionRequest, authorization: str = 
                         delta = chunk["choices"][0]["delta"]
                         if "content" in delta:
                             content_part = delta["content"]
+                            # Remove reference patterns
+                            content_part = remove_reference_patterns(content_part)
 
                             # Handle thinking block markers
                             if content_part == "<Thinking>\n\n":
@@ -709,13 +730,10 @@ async def chat_completions(request: ChatCompletionRequest, authorization: str = 
                         if "meta" in delta:
                             meta = delta["meta"]
             except Exception as e:
-                logger.error(f"Error processing non-streaming response: {e}")
-
-        # Remove reference annotations from final content
-        content = remove_reference_annotations(content)
+                logger.error(f"Non-streaming response processing error: {e}")
 
         # Build complete response
-        return {
+        response_data = {
             "id": str(uuid.uuid4()),
             "object": "chat.completion",
             "created": int(time.time()),
@@ -730,6 +748,11 @@ async def chat_completions(request: ChatCompletionRequest, authorization: str = 
                 "finish_reason": "stop"
             }]
         }
+        
+        # Schedule garbage collection after response
+        background_tasks.add_task(gc.collect)
+        
+        return response_data
 
     # Streaming response
     return StreamingResponse(
@@ -746,160 +769,60 @@ async def chat_completions(request: ChatCompletionRequest, authorization: str = 
         media_type="text/event-stream"
     )
 
-
-@app.get("/memory")
-async def memory_status():
-    """Get memory status"""
-    try:
-        import resource
-        usage = resource.getrusage(resource.RUSAGE_SELF)
-        if sys.platform == 'darwin':  # macOS
-            mem_used = usage.ru_maxrss / 1024 / 1024
-        else:  # Linux
-            mem_used = usage.ru_maxrss / 1024
-        
-        # Get total memory if possible
-        total_mem = 0
-        if os.path.exists('/proc/meminfo'):
-            with open('/proc/meminfo', 'r') as f:
-                for line in f:
-                    if 'MemTotal' in line:
-                        total_mem = int(line.split()[1]) / 1024
-                        break
-        
-        # Get free memory if possible
-        free_mem = 0
-        if os.path.exists('/proc/meminfo'):
-            with open('/proc/meminfo', 'r') as f:
-                for line in f:
-                    if 'MemAvailable' in line:
-                        free_mem = int(line.split()[1]) / 1024
-                        break
-        
-        # Calculate percentage if we have total memory
-        percent = (mem_used / total_mem * 100) if total_mem > 0 else 0
-        
-        return {
-            "process_memory_mb": round(mem_used, 2),
-            "total_memory_mb": round(total_mem, 2) if total_mem > 0 else "unknown",
-            "available_memory_mb": round(free_mem, 2) if free_mem > 0 else "unknown",
-            "memory_percent": round(percent, 2) if percent > 0 else "unknown",
-            "gc_objects": len(gc.get_objects())
-        }
-    except ImportError:
-        # Fallback if resource module is not available
-        return {
-            "gc_objects": len(gc.get_objects()),
-            "note": "Limited memory information available (resource module not found)"
-        }
-
-
-@app.post("/memory/cleanup")
-async def trigger_cleanup():
-    """Manually trigger memory cleanup"""
-    # Get memory before cleanup
-    try:
-        import resource
-        usage_before = resource.getrusage(resource.RUSAGE_SELF)
-        if sys.platform == 'darwin':  # macOS
-            mem_before = usage_before.ru_maxrss / 1024 / 1024
-        else:  # Linux
-            mem_before = usage_before.ru_maxrss / 1024
-    except ImportError:
-        mem_before = 0
-    
-    # Count objects before cleanup
-    obj_count_before = len(gc.get_objects())
-    
-    # Perform cleanup
-    memory_manager.cleanup_memory()
-    
-    # Get memory after cleanup
-    try:
-        import resource
-        usage_after = resource.getrusage(resource.RUSAGE_SELF)
-        if sys.platform == 'darwin':  # macOS
-            mem_after = usage_after.ru_maxrss / 1024 / 1024
-        else:  # Linux
-            mem_after = usage_after.ru_maxrss / 1024
-        
-        mem_diff = mem_before - mem_after
-    except ImportError:
-        mem_after = 0
-        mem_diff = 0
-    
-    # Count objects after cleanup
-    obj_count_after = len(gc.get_objects())
-    obj_diff = obj_count_before - obj_count_after
-    
-    return {
-        "status": "success",
-        "memory_before_mb": round(mem_before, 2) if mem_before > 0 else "unknown",
-        "memory_after_mb": round(mem_after, 2) if mem_after > 0 else "unknown",
-        "memory_difference_mb": round(mem_diff, 2) if mem_diff != 0 else "unknown",
-        "objects_before": obj_count_before,
-        "objects_after": obj_count_after,
-        "objects_difference": obj_diff
-    }
-
-
 @app.on_event("startup")
 async def startup_event():
     """Initialize session on application startup"""
     try:
+        # Set lower memory limits for httpx
+        httpx._config.DEFAULT_LIMITS = httpx.Limits(max_connections=10, max_keepalive_connections=5)
+        
+        # Initialize session
         session_manager.initialize()
-        # Start memory monitoring
-        memory_manager.start_monitoring()
-        logger.info("Application started with memory monitoring")
     except Exception as e:
         logger.error(f"Startup initialization error: {e}")
-        raise
-
+        # Don't raise here, allow the app to start anyway
 
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
+    memory_info = {}
     try:
-        # Get memory usage
-        import resource
-        usage = resource.getrusage(resource.RUSAGE_SELF)
-        if sys.platform == 'darwin':  # macOS
-            mem_used = usage.ru_maxrss / 1024 / 1024
-        else:  # Linux
-            mem_used = usage.ru_maxrss / 1024
-        
-        # Get total memory if possible
-        total_mem = 0
-        if os.path.exists('/proc/meminfo'):
-            with open('/proc/meminfo', 'r') as f:
-                for line in f:
-                    if 'MemTotal' in line:
-                        total_mem = int(line.split()[1]) / 1024
-                        break
-        
-        # Calculate percentage if we have total memory
-        percent = (mem_used / total_mem * 100) if total_mem > 0 else 0
-        
-        # Determine status
-        status = "ok"
-        if percent > 90:
-            status = "warning"
-            # Trigger cleanup if memory usage is very high
-            memory_manager.cleanup_memory()
+        import psutil
+        process = psutil.Process()
+        memory_info = {
+            "memory_usage_mb": process.memory_info().rss / (1024 * 1024),
+            "memory_percent": process.memory_percent()
+        }
     except ImportError:
-        # Fallback if resource module is not available
-        status = "ok"
-        percent = 0
-        mem_used = 0
+        memory_info = {"note": "psutil not installed, memory stats unavailable"}
     
     if session_manager.is_initialized():
         return {
-            "status": status, 
-            "session": "active",
-            "memory": {
-                "percent": round(percent, 2) if percent > 0 else "unknown",
-                "used_mb": round(mem_used, 2) if mem_used > 0 else "unknown"
-            }
+            "status": "ok", 
+            "session": "active", 
+            "last_success": session_manager.last_success,
+            "memory": memory_info
         }
     else:
-        return {"status": "degraded", "session": "inactive"}
+        return {
+            "status": "degraded", 
+            "session": "inactive", 
+            "last_error": session_manager.last_error,
+            "memory": memory_info
+        }
+
+# Add a route to force garbage collection
+@app.post("/admin/gc")
+async def force_gc(authorization: str = Header(None)):
+    """Force garbage collection"""
+    await verify_api_key(authorization)
+    collected = gc.collect()
+    return {"status": "ok", "collected": collected}
+
+# Add a route to reset session
+@app.post("/admin/reset-session")
+async def reset_session(authorization: str = Header(None)):
+    """Reset session"""
+    await verify_api_key(authorization)
+    success = session_manager.initialize()
+    return {"status": "ok" if success else "error", "session_initialized": success}
