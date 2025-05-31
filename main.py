@@ -530,7 +530,7 @@ async def generate_response(messages: List[dict], model: str, temperature: float
                 'icon': 'https://wy-static.wenxiaobai.com/bot-capability/prod/%E6%B7%B1%E5%BA%A6%E6%80%9D%E8%80%83.png',
                 'minAppVersion': '',
                 'title': '深度思考(R1)',
-                'botId': 210029,
+                'botId': 210012,
                 'botDesc': '深度回答这个问题（DeepSeek R1）',
                 'selectedIcon': 'https://wy-static.wenxiaobai.com/bot-capability/prod/%E6%B7%B1%E5%BA%A6%E6%80%9D%E8%80%83%E9%80%89%E4%B8%AD.png',
                 'botIcon': 'https://platform-dev-1319140468.cos.ap-nanjing.myqcloud.com/bot/avatar/2025/02/06/612cbff8-51e6-4c6a-8530-cb551bcfda56.webp',
